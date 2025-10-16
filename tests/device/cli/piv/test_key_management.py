@@ -1,13 +1,16 @@
+import os
+import tempfile
+
+import pytest
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+
 from yubikit.core import NotSupportedError
-from .util import DEFAULT_PIN, DEFAULT_MANAGEMENT_KEY
+from yubikit.management import CAPABILITY
+
 from ... import condition
-import tempfile
-import os
-import pytest
 
 
 def generate_pem_eccp256_keypair():
@@ -45,7 +48,7 @@ def tmp_file():
 
 class TestKeyExport:
     @condition.min_version(5, 3)
-    def test_from_metadata(self, ykman_cli):
+    def test_from_metadata(self, ykman_cli, keys):
         pair = generate_pem_eccp256_keypair()
 
         ykman_cli(
@@ -54,7 +57,7 @@ class TestKeyExport:
             "import",
             "9a",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
             input=pair[0],
         )
@@ -62,7 +65,7 @@ class TestKeyExport:
         assert exported == pair[1]
 
     @condition.min_version(4, 3)
-    def test_from_metadata_or_attestation(self, ykman_cli):
+    def test_from_metadata_or_attestation(self, ykman_cli, keys):
         der = ykman_cli(
             "piv",
             "keys",
@@ -73,7 +76,7 @@ class TestKeyExport:
             "-F",
             "der",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
         ).stdout_bytes
         exported = ykman_cli(
@@ -81,7 +84,7 @@ class TestKeyExport:
         ).stdout_bytes
         assert der == exported
 
-    def test_from_metadata_or_cert(self, ykman_cli):
+    def test_from_metadata_or_cert(self, ykman_cli, keys):
         private_key_pem, public_key_pem = generate_pem_eccp256_keypair()
         ykman_cli(
             "piv",
@@ -89,7 +92,7 @@ class TestKeyExport:
             "import",
             "9a",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
             input=private_key_pem,
         )
@@ -100,9 +103,9 @@ class TestKeyExport:
             "9a",
             "-",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-P",
-            DEFAULT_PIN,
+            keys.pin,
             "-s",
             "test",
             input=public_key_pem,
@@ -113,7 +116,7 @@ class TestKeyExport:
         assert public_key_pem == exported
 
     @condition.max_version(5, 2, 9)
-    def test_from_cert_verify(self, ykman_cli):
+    def test_from_cert_verify(self, ykman_cli, keys):
         private_key_pem, public_key_pem = generate_pem_eccp256_keypair()
         ykman_cli(
             "piv",
@@ -121,7 +124,7 @@ class TestKeyExport:
             "import",
             "9a",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
             input=private_key_pem,
         )
@@ -132,17 +135,17 @@ class TestKeyExport:
             "9a",
             "-",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-P",
-            DEFAULT_PIN,
+            keys.pin,
             "-s",
             "test",
             input=public_key_pem,
         )
-        ykman_cli("piv", "keys", "export", "9a", "--verify", "-P", DEFAULT_PIN, "-")
+        ykman_cli("piv", "keys", "export", "9a", "--verify", "-P", keys.pin, "-")
 
     @condition.max_version(5, 2, 9)
-    def test_from_cert_verify_fails(self, ykman_cli):
+    def test_from_cert_verify_fails(self, ykman_cli, keys):
         private_key_pem = generate_pem_eccp256_keypair()[0]
         public_key_pem = generate_pem_eccp256_keypair()[1]
         ykman_cli(
@@ -151,7 +154,7 @@ class TestKeyExport:
             "import",
             "9a",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
             input=private_key_pem,
         )
@@ -162,35 +165,34 @@ class TestKeyExport:
             "9a",
             "-",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-P",
-            DEFAULT_PIN,
+            keys.pin,
             "-s",
             "test",
             input=public_key_pem,
         )
         with pytest.raises(SystemExit):
-            ykman_cli("piv", "keys", "export", "9a", "--verify", "-P", DEFAULT_PIN, "-")
+            ykman_cli("piv", "keys", "export", "9a", "--verify", "-P", keys.pin, "-")
 
 
 class TestKeyManagement:
     @condition.check(not_roca)
-    def test_generate_key_default(self, ykman_cli):
-        output = ykman_cli(
-            "piv", "keys", "generate", "9a", "-m", DEFAULT_MANAGEMENT_KEY, "-"
-        ).output
+    def test_generate_key_default(self, ykman_cli, keys):
+        output = ykman_cli("piv", "keys", "generate", "9a", "-m", keys.mgmt, "-").output
         assert "BEGIN PUBLIC KEY" in output
 
     @condition.check(roca)
-    def test_generate_key_default_cve201715361(self, ykman_cli):
+    def test_generate_key_default_cve201715361(self, ykman_cli, keys):
         with pytest.raises(NotSupportedError):
-            ykman_cli(
-                "piv", "keys", "generate", "9a", "-m", DEFAULT_MANAGEMENT_KEY, "-"
-            )
+            ykman_cli("piv", "keys", "generate", "9a", "-m", keys.mgmt, "-")
 
     @condition.check(not_roca)
     @condition.yk4_fips(False)
-    def test_generate_key_rsa1024(self, ykman_cli):
+    def test_generate_key_rsa1024(self, ykman_cli, info, keys):
+        if CAPABILITY.PIV in info.fips_capable:
+            pytest.skip("RSA1024 not available on FIPS")
+
         output = ykman_cli(
             "piv",
             "keys",
@@ -199,13 +201,13 @@ class TestKeyManagement:
             "-a",
             "RSA1024",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
         ).output
         assert "BEGIN PUBLIC KEY" in output
 
     @condition.check(not_roca)
-    def test_generate_key_rsa2048(self, ykman_cli):
+    def test_generate_key_rsa2048(self, ykman_cli, keys):
         output = ykman_cli(
             "piv",
             "keys",
@@ -214,14 +216,14 @@ class TestKeyManagement:
             "-a",
             "RSA2048",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
         ).output
         assert "BEGIN PUBLIC KEY" in output
 
     @condition.yk4_fips(False)
     @condition.check(roca)
-    def test_generate_key_rsa1024_cve201715361(self, ykman_cli):
+    def test_generate_key_rsa1024_cve201715361(self, ykman_cli, keys):
         with pytest.raises(NotSupportedError):
             ykman_cli(
                 "piv",
@@ -231,12 +233,12 @@ class TestKeyManagement:
                 "-a",
                 "RSA1024",
                 "-m",
-                DEFAULT_MANAGEMENT_KEY,
+                keys.mgmt,
                 "-",
             )
 
     @condition.check(roca)
-    def test_generate_key_rsa2048_cve201715361(self, ykman_cli):
+    def test_generate_key_rsa2048_cve201715361(self, ykman_cli, keys):
         with pytest.raises(NotSupportedError):
             ykman_cli(
                 "piv",
@@ -246,11 +248,11 @@ class TestKeyManagement:
                 "-a",
                 "RSA2048",
                 "-m",
-                DEFAULT_MANAGEMENT_KEY,
+                keys.mgmt,
                 "-",
             )
 
-    def test_generate_key_eccp256(self, ykman_cli):
+    def test_generate_key_eccp256(self, ykman_cli, keys):
         output = ykman_cli(
             "piv",
             "keys",
@@ -259,25 +261,25 @@ class TestKeyManagement:
             "-a",
             "ECCP256",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
         ).output
         assert "BEGIN PUBLIC KEY" in output
 
-    def test_import_key_eccp256(self, ykman_cli):
+    def test_import_key_eccp256(self, ykman_cli, keys):
         ykman_cli(
             "piv",
             "keys",
             "import",
             "9a",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
             input=generate_pem_eccp256_keypair()[0],
         )
 
     @condition.min_version(4)
-    def test_generate_key_eccp384(self, ykman_cli):
+    def test_generate_key_eccp384(self, ykman_cli, keys):
         output = ykman_cli(
             "piv",
             "keys",
@@ -286,13 +288,13 @@ class TestKeyManagement:
             "-a",
             "ECCP384",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
         ).output
         assert "BEGIN PUBLIC KEY" in output
 
     @condition.min_version(4)
-    def test_generate_key_pin_policy_always(self, ykman_cli):
+    def test_generate_key_pin_policy_always(self, ykman_cli, keys):
         output = ykman_cli(
             "piv",
             "keys",
@@ -301,7 +303,7 @@ class TestKeyManagement:
             "--pin-policy",
             "ALWAYS",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-a",
             "ECCP256",
             "-",
@@ -309,7 +311,7 @@ class TestKeyManagement:
         assert "BEGIN PUBLIC KEY" in output
 
     @condition.min_version(4)
-    def test_import_key_pin_policy_always(self, ykman_cli):
+    def test_import_key_pin_policy_always(self, ykman_cli, keys):
         for pin_policy in ["ALWAYS", "always"]:
             ykman_cli(
                 "piv",
@@ -319,13 +321,13 @@ class TestKeyManagement:
                 "--pin-policy",
                 pin_policy,
                 "-m",
-                DEFAULT_MANAGEMENT_KEY,
+                keys.mgmt,
                 "-",
                 input=generate_pem_eccp256_keypair()[0],
             )
 
     @condition.min_version(4)
-    def test_generate_key_touch_policy_always(self, ykman_cli):
+    def test_generate_key_touch_policy_always(self, ykman_cli, keys):
         output = ykman_cli(
             "piv",
             "keys",
@@ -334,7 +336,7 @@ class TestKeyManagement:
             "--touch-policy",
             "ALWAYS",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-a",
             "ECCP256",
             "-",
@@ -342,7 +344,7 @@ class TestKeyManagement:
         assert "BEGIN PUBLIC KEY" in output
 
     @condition.min_version(4)
-    def test_import_key_touch_policy_always(self, ykman_cli):
+    def test_import_key_touch_policy_always(self, ykman_cli, keys):
         for touch_policy in ["ALWAYS", "always"]:
             ykman_cli(
                 "piv",
@@ -352,13 +354,13 @@ class TestKeyManagement:
                 "--touch-policy",
                 touch_policy,
                 "-m",
-                DEFAULT_MANAGEMENT_KEY,
+                keys.mgmt,
                 "-",
                 input=generate_pem_eccp256_keypair()[0],
             )
 
     @condition.min_version(4, 3)
-    def test_attest_key(self, ykman_cli):
+    def test_attest_key(self, ykman_cli, keys):
         ykman_cli(
             "piv",
             "keys",
@@ -367,13 +369,13 @@ class TestKeyManagement:
             "-a",
             "ECCP256",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
         )
         output = ykman_cli("piv", "keys", "attest", "9a", "-").output
         assert "BEGIN CERTIFICATE" in output
 
-    def _test_generate_csr(self, ykman_cli, tmp_file, algo):
+    def _test_generate_csr(self, ykman_cli, keys, tmp_file, algo):
         ykman_cli(
             "piv",
             "keys",
@@ -382,7 +384,7 @@ class TestKeyManagement:
             "-a",
             algo,
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             tmp_file,
         )
         output = ykman_cli(
@@ -394,7 +396,7 @@ class TestKeyManagement:
             "-s",
             "test-subject",
             "-P",
-            DEFAULT_PIN,
+            keys.pin,
             "-",
         ).output
         csr = x509.load_pem_x509_csr(output.encode(), default_backend())
@@ -402,13 +404,18 @@ class TestKeyManagement:
 
     @condition.yk4_fips(False)
     @condition.check(not_roca)
-    def test_generate_csr_rsa1024(self, ykman_cli, tmp_file):
-        self._test_generate_csr(ykman_cli, tmp_file, "RSA1024")
+    def test_generate_csr_rsa1024(self, ykman_cli, keys, info, tmp_file):
+        if CAPABILITY.PIV in info.fips_capable:
+            pytest.skip("RSA1024 not available on FIPS")
 
-    def test_generate_csr_eccp256(self, ykman_cli, tmp_file):
-        self._test_generate_csr(ykman_cli, tmp_file, "ECCP256")
+        self._test_generate_csr(ykman_cli, keys, tmp_file, "RSA1024")
 
-    def test_import_verify_correct_cert_succeeds_with_pin(self, ykman_cli, tmp_file):
+    def test_generate_csr_eccp256(self, ykman_cli, keys, tmp_file):
+        self._test_generate_csr(ykman_cli, keys, tmp_file, "ECCP256")
+
+    def test_import_verify_correct_cert_succeeds_with_pin(
+        self, ykman_cli, keys, tmp_file
+    ):
         # Set up a key in the slot and create a certificate for it
         public_key_pem = ykman_cli(
             "piv",
@@ -418,7 +425,7 @@ class TestKeyManagement:
             "-a",
             "ECCP256",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
         ).output
 
@@ -429,9 +436,9 @@ class TestKeyManagement:
             "9a",
             "-",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-P",
-            DEFAULT_PIN,
+            keys.pin,
             "-s",
             "test",
             input=public_key_pem,
@@ -448,7 +455,7 @@ class TestKeyManagement:
                 "9a",
                 tmp_file,
                 "-m",
-                DEFAULT_MANAGEMENT_KEY,
+                keys.mgmt,
             )
 
         ykman_cli(
@@ -459,9 +466,9 @@ class TestKeyManagement:
             "9a",
             tmp_file,
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-P",
-            DEFAULT_PIN,
+            keys.pin,
         )
         ykman_cli(
             "piv",
@@ -471,11 +478,11 @@ class TestKeyManagement:
             "9a",
             tmp_file,
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
-            input=DEFAULT_PIN,
+            keys.mgmt,
+            input=keys.pin,
         )
 
-    def test_import_verify_wrong_cert_fails(self, ykman_cli):
+    def test_import_verify_wrong_cert_fails(self, ykman_cli, keys):
         # Set up a key in the slot and create a certificate for it
         public_key_pem = ykman_cli(
             "piv",
@@ -485,7 +492,7 @@ class TestKeyManagement:
             "-a",
             "ECCP256",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
         ).output
 
@@ -496,9 +503,9 @@ class TestKeyManagement:
             "9a",
             "-",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-P",
-            DEFAULT_PIN,
+            keys.pin,
             "-s",
             "test",
             input=public_key_pem,
@@ -515,7 +522,7 @@ class TestKeyManagement:
             "-a",
             "ECCP256",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
             input=public_key_pem,
         )
@@ -529,13 +536,13 @@ class TestKeyManagement:
                 "9a",
                 "-",
                 "-m",
-                DEFAULT_MANAGEMENT_KEY,
+                keys.mgmt,
                 "-P",
-                DEFAULT_PIN,
+                keys.pin,
                 input=cert_pem,
             )
 
-    def test_import_no_verify_wrong_cert_succeeds(self, ykman_cli):
+    def test_import_no_verify_wrong_cert_succeeds(self, ykman_cli, keys):
         # Set up a key in the slot and create a certificate for it
         public_key_pem = ykman_cli(
             "piv",
@@ -545,7 +552,7 @@ class TestKeyManagement:
             "-a",
             "ECCP256",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
         ).output
 
@@ -556,9 +563,9 @@ class TestKeyManagement:
             "9a",
             "-",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-P",
-            DEFAULT_PIN,
+            keys.pin,
             "-s",
             "test",
             input=public_key_pem,
@@ -575,7 +582,7 @@ class TestKeyManagement:
             "-a",
             "ECCP256",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-",
             input=public_key_pem,
         )
@@ -589,9 +596,9 @@ class TestKeyManagement:
                 "9a",
                 "-",
                 "-m",
-                DEFAULT_MANAGEMENT_KEY,
+                keys.mgmt,
                 "-P",
-                DEFAULT_PIN,
+                keys.pin,
                 input=cert_pem,
             )
 
@@ -602,9 +609,9 @@ class TestKeyManagement:
             "9a",
             "-",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             "-P",
-            DEFAULT_PIN,
+            keys.pin,
             input=cert_pem,
         )
 

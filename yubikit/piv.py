@@ -25,64 +25,79 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from .core import (
-    require_version as _require_version,
-    int2bytes,
-    bytes2int,
-    Version,
-    Tlv,
-    NotSupportedError,
-    BadResponseError,
-    InvalidPinError,
-)
-from .core.smartcard import (
-    SW,
-    AID,
-    ApduError,
-    ApduFormat,
-    SmartCardConnection,
-    SmartCardProtocol,
-)
+from __future__ import annotations
+
+import gzip
+import logging
+import os
+import re
+import warnings
+from dataclasses import astuple, dataclass
+from datetime import date
+from enum import Enum, IntEnum, unique
+from typing import TYPE_CHECKING, TypeAlias, cast, overload
 
 from cryptography import x509
+from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa, x25519
+from cryptography.hazmat.primitives.asymmetric.padding import AsymmetricPadding
+from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.constant_time import bytes_eq
 from cryptography.hazmat.primitives.serialization import (
     Encoding,
-    PublicFormat,
-    PrivateFormat,
     NoEncryption,
+    PrivateFormat,
+    PublicFormat,
 )
-from cryptography.hazmat.primitives.asymmetric import rsa, ec, ed25519, x25519
-from cryptography.hazmat.primitives.asymmetric.padding import AsymmetricPadding
-from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
-from cryptography.hazmat.backends import default_backend
 
-from dataclasses import dataclass
-from enum import Enum, IntEnum, unique
-from typing import Optional, Union, Type, cast
+from .core import (
+    BadResponseError,
+    InvalidPinError,
+    NotSupportedError,
+    Tlv,
+    Version,
+    _override_version,
+    bytes2int,
+    int2bytes,
+    require_version,
+)
+from .core.smartcard import (
+    AID,
+    SW,
+    ApduError,
+    ScpKeyParams,
+    SmartCardConnection,
+    SmartCardProtocol,
+)
 
-import logging
-import gzip
-import os
-import re
+if TYPE_CHECKING:
+    # This type isn't available on cryptography <40.
+    from cryptography.hazmat.primitives.asymmetric.types import PublicKeyTypes
 
 
 logger = logging.getLogger(__name__)
+
+
+PublicKey: TypeAlias = (
+    rsa.RSAPublicKey
+    | ec.EllipticCurvePublicKey
+    | ed25519.Ed25519PublicKey
+    | x25519.X25519PublicKey
+)
+PrivateKey: TypeAlias = (
+    rsa.RSAPrivateKeyWithSerialization
+    | ec.EllipticCurvePrivateKeyWithSerialization
+    | ed25519.Ed25519PrivateKey
+    | x25519.X25519PrivateKey
+)
 
 
 @unique
 class ALGORITHM(str, Enum):
     EC = "ec"
     RSA = "rsa"
-
-
-# Don't treat pre 1.0 versions as "developer builds".
-def require_version(my_version: Version, *args, **kwargs):
-    if my_version <= (0, 1, 4):  # Last pre 1.0 release of ykneo-piv
-        my_version = Version(1, 0, 0)
-    _require_version(my_version, *args, **kwargs)
 
 
 @unique
@@ -100,11 +115,11 @@ class KEY_TYPE(IntEnum):
         return self.name
 
     @property
-    def algorithm(self):
+    def algorithm(self) -> ALGORITHM:
         return ALGORITHM.RSA if self.name.startswith("RSA") else ALGORITHM.EC
 
     @property
-    def bit_len(self):
+    def bit_len(self) -> int:
         if self in (KEY_TYPE.ED25519, KEY_TYPE.X25519):
             return 256
         match = re.search(r"\d+$", self.name)
@@ -113,7 +128,7 @@ class KEY_TYPE(IntEnum):
         raise ValueError("No bit_len")
 
     @classmethod
-    def from_public_key(cls, key):
+    def from_public_key(cls, key: PublicKeyTypes) -> KEY_TYPE:
         if isinstance(key, rsa.RSAPublicKey):
             try:
                 return getattr(cls, "RSA%d" % key.key_size)
@@ -141,14 +156,14 @@ class MANAGEMENT_KEY_TYPE(IntEnum):
     AES256 = 0x0C
 
     @property
-    def key_len(self):
+    def key_len(self) -> int:
         if self.name == "TDES":
             return 24
         # AES
         return int(self.name[3:]) // 8
 
     @property
-    def challenge_len(self):
+    def challenge_len(self) -> int:
         if self.name == "TDES":
             return 8
         return 16
@@ -156,7 +171,12 @@ class MANAGEMENT_KEY_TYPE(IntEnum):
 
 def _parse_management_key(key_type, management_key):
     if key_type == MANAGEMENT_KEY_TYPE.TDES:
-        return algorithms.TripleDES(management_key)
+        # TripleDES moved to decrepit in cryptography 43
+        try:
+            from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
+        except ImportError:
+            TripleDES = algorithms.TripleDES
+        return TripleDES(management_key)
     else:
         return algorithms.AES(management_key)
 
@@ -240,7 +260,7 @@ class OBJECT_ID(IntEnum):
     ATTESTATION = 0x5FFF01
 
     @classmethod
-    def from_slot(cls, slot):
+    def from_slot(cls, slot: SLOT) -> OBJECT_ID:
         return getattr(cls, SLOT(slot).name)
 
 
@@ -282,6 +302,7 @@ INS_GET_DATA = 0xCB
 INS_PUT_DATA = 0xDB
 INS_MOVE_KEY = 0xF6
 INS_GET_METADATA = 0xF7
+INS_GET_SERIAL = 0xF8
 INS_ATTEST = 0xF9
 INS_SET_PIN_RETRIES = 0xFA
 INS_RESET = 0xFB
@@ -378,6 +399,148 @@ class BioMetadata:
     temporary_pin: bool
 
 
+def _bcd(val, ln=1):
+    bits = f"{val % 10:04b}"[::-1]
+    bits += str((bits.count("1") + 1) % 2)
+    return bits if ln == 1 else _bcd(val // 10, ln - 1) + bits
+
+
+def _dump_tlv_dict(values: dict[int, bytes | None]) -> bytes:
+    return b"".join(
+        Tlv(tag, value) for tag, value in values.items() if value is not None
+    )
+
+
+BCD_SS = "11010"
+BCD_FS = "10110"
+BCD_ES = "11111"
+
+_FASCN_LENS = (4, 4, 6, 1, 1, 10, 1, 4, 1)
+
+
+@dataclass
+class FascN:
+    """FASC-N data structure
+
+    https://www.idmanagement.gov/docs/pacs-tig-scepacs.pdf
+    """
+
+    agency_code: int  # 4 digits
+    system_code: int  # 4 digits
+    credential_number: int  # 6 digits
+    credential_series: int  # 1 digit
+    individual_credential_issue: int  # 1 digit
+    person_identifier: int  # 10 digits
+    organizational_category: int  # 1 digit
+    organizational_identifier: int  # 4 digits
+    organization_association_category: int  # 1 digit
+
+    def __bytes__(self):
+        # Convert values to BCD
+        vs = iter(_bcd(v, ln) for v, ln in zip(astuple(self), _FASCN_LENS))
+
+        # Add separators
+        bs = (
+            BCD_SS
+            + next(vs)
+            + BCD_FS
+            + next(vs)
+            + BCD_FS
+            + next(vs)
+            + BCD_FS
+            + next(vs)
+            + BCD_FS
+            + next(vs)
+            + BCD_FS
+            + next(vs)
+            + next(vs)
+            + next(vs)
+            + next(vs)
+            + BCD_ES
+        )
+
+        # Calculate LRC
+        lrc = 0
+        for i in range(0, len(bs), 5):
+            lrc ^= int(bs[i : i + 5], 2)
+
+        return int2bytes(int(bs, 2) << 5 | lrc)
+
+    @classmethod
+    def from_bytes(cls, value: bytes) -> FascN:
+        bs = f"{bytes2int(value):0200b}"
+        ds = [int(bs[i : i + 4][::-1], 2) for i in range(0, 200, 5)]
+        args = (
+            int("".join(str(d) for d in ds[offs : offs + ln]))
+            # offsets considering separators
+            for offs, ln in zip((1, 6, 11, 18, 20, 22, 32, 33, 37), _FASCN_LENS)
+        )
+        return cls(*args)
+
+    def __str__(self):
+        return "[%04d-%04d-%06d-%d-%d-%010d%d%04d%d]" % astuple(self)
+
+
+@dataclass(kw_only=True)
+class Chuid:
+    buffer_length: int | None = None
+    fasc_n: FascN
+    agency_code: bytes | None = None
+    organizational_identifier: bytes | None = None
+    duns: bytes | None = None
+    guid: bytes
+    expiration_date: date
+    authentication_key_map: bytes | None = None
+    asymmetric_signature: bytes
+    lrc: int | None = None
+
+    def _get_bytes(self, include_signature: bool = True) -> bytes:
+        return _dump_tlv_dict(
+            {
+                0xEE: int2bytes(self.buffer_length)
+                if self.buffer_length is not None
+                else None,
+                0x30: bytes(self.fasc_n),
+                0x31: self.agency_code,
+                0x32: self.organizational_identifier,
+                0x33: self.duns,
+                0x34: self.guid,
+                0x35: self.expiration_date.isoformat().replace("-", "").encode(),
+                0x3D: self.authentication_key_map,
+                0x3E: self.asymmetric_signature if include_signature else None,
+                TAG_LRC: bytes([self.lrc]) if self.lrc is not None else b"",
+            }
+        )
+
+    @property
+    def tbs_bytes(self) -> bytes:
+        return self._get_bytes(include_signature=False)
+
+    def __bytes__(self):
+        return self._get_bytes()
+
+    @classmethod
+    def from_bytes(cls, value: bytes) -> Chuid:
+        data = Tlv.parse_dict(value)
+        buffer_length = data.get(0xEE)
+        lrc = data.get(TAG_LRC)
+        # From Python 3.11: date.fromisoformat(data[0x35])
+        d = data[0x35]
+        expiration_date = date(int(d[:4]), int(d[4:6]), int(d[6:8]))
+        return cls(
+            buffer_length=bytes2int(buffer_length) if buffer_length else None,
+            fasc_n=FascN.from_bytes(data[0x30]),
+            agency_code=data.get(0x31),
+            organizational_identifier=data.get(0x32),
+            duns=data.get(0x33),
+            guid=data[0x34],
+            expiration_date=expiration_date,
+            authentication_key_map=data.get(0x3D),
+            asymmetric_signature=data[0x3E],
+            lrc=lrc[0] if lrc else None,
+        )
+
+
 def _pad_message(key_type, message, hash_algorithm, padding):
     if key_type in (KEY_TYPE.ED25519, KEY_TYPE.X25519):
         return message
@@ -422,18 +585,34 @@ def check_key_support(
 
     This method will return None if the key (with PIN and touch policies) is supported,
     or it will raise a NotSupportedError if it is not.
+
+    :deprecated: Use PivSession.check_key_support() instead.
     """
-    if version[0] == 0 and version > (0, 1, 3):
-        return  # Development build, skip version checks
+    warnings.warn(
+        "Deprecated: use PivSession.check_key_support() instead.",
+        DeprecationWarning,
+    )
+    _do_check_key_support(version, key_type, pin_policy, touch_policy, generate)
 
-    if version < (4, 0, 0):
-        if key_type == KEY_TYPE.ECCP384:
-            raise NotSupportedError("ECCP384 requires YubiKey 4 or later")
-        if touch_policy != TOUCH_POLICY.DEFAULT or pin_policy != PIN_POLICY.DEFAULT:
-            raise NotSupportedError("PIN/Touch policy requires YubiKey 4 or later")
 
-    if version < (4, 3, 0) and touch_policy == TOUCH_POLICY.CACHED:
-        raise NotSupportedError("Cached touch policy requires YubiKey 4.3 or later")
+def _do_check_key_support(
+    version: Version,
+    key_type: KEY_TYPE,
+    pin_policy: PIN_POLICY,
+    touch_policy: TOUCH_POLICY,
+    generate: bool = True,
+    fips_restrictions: bool = False,
+) -> None:
+    if key_type == KEY_TYPE.ECCP384:
+        require_version(version, (4, 0, 0), "ECCP384 requires YubiKey 4 or later")
+    if touch_policy != TOUCH_POLICY.DEFAULT or pin_policy != PIN_POLICY.DEFAULT:
+        require_version(
+            version, (4, 0, 0), "PIN/Touch policy requires YubiKey 4 or later"
+        )
+    if touch_policy == TOUCH_POLICY.CACHED:
+        require_version(
+            version, (4, 3, 0), "Cached touch policy requires YubiKey 4.3 or later"
+        )
 
     # ROCA
     if (4, 2, 0) <= version < (4, 3, 5):
@@ -441,28 +620,20 @@ def check_key_support(
             raise NotSupportedError("RSA key generation not supported on this YubiKey")
 
     # FIPS
-    if (4, 4, 0) <= version < (4, 5, 0):
-        if key_type == KEY_TYPE.RSA1024:
-            raise NotSupportedError("RSA 1024 not supported on YubiKey FIPS (4 Series)")
+    if fips_restrictions or (4, 4, 0) <= version < (4, 5, 0):
+        if key_type in (KEY_TYPE.RSA1024, KEY_TYPE.X25519):
+            raise NotSupportedError("RSA 1024 not supported on YubiKey FIPS")
         if pin_policy == PIN_POLICY.NEVER:
-            raise NotSupportedError(
-                "PIN_POLICY.NEVER not allowed on YubiKey FIPS (4 Series)"
-            )
+            raise NotSupportedError("PIN_POLICY.NEVER not allowed on YubiKey FIPS")
 
     # New key types
-    if version < (5, 7, 0) and key_type in (
+    if key_type in (
         KEY_TYPE.RSA3072,
         KEY_TYPE.RSA4096,
         KEY_TYPE.ED25519,
         KEY_TYPE.X25519,
     ):
-        raise NotSupportedError(f"{key_type} requires YubiKey 5.7 or later")
-
-    # TODO: Detect Bio capabilities
-    if version < () and pin_policy in (PIN_POLICY.MATCH_ONCE, PIN_POLICY.MATCH_ALWAYS):
-        raise NotSupportedError(
-            "Biometric match PIN policy requires YubiKey 5.6 or later"
-        )
+        require_version(version, (5, 7, 0), f"{key_type} requires YubiKey 5.7 or later")
 
 
 def _parse_device_public_key(key_type, encoded):
@@ -477,7 +648,7 @@ def _parse_device_public_key(key_type, encoded):
         return x25519.X25519PublicKey.from_public_bytes(data[0x86])
     else:
         if key_type == KEY_TYPE.ECCP256:
-            curve: Type[ec.EllipticCurve] = ec.SECP256R1
+            curve: type[ec.EllipticCurve] = ec.SECP256R1
         else:
             curve = ec.SECP384R1
 
@@ -487,24 +658,48 @@ def _parse_device_public_key(key_type, encoded):
 class PivSession:
     """A session with the PIV application."""
 
-    def __init__(self, connection: SmartCardConnection):
+    def __init__(
+        self,
+        connection: SmartCardConnection,
+        scp_key_params: ScpKeyParams | None = None,
+    ):
         self.protocol = SmartCardProtocol(connection)
         self.protocol.select(AID.PIV)
-        self._version = Version.from_bytes(
-            self.protocol.send_apdu(0, INS_GET_VERSION, 0, 0)
+
+        if scp_key_params:
+            self.protocol.init_scp(scp_key_params)
+
+        logger.debug("Getting PIV version")
+        self._version = _override_version.patch(
+            Version.from_bytes(self.protocol.send_apdu(0, INS_GET_VERSION, 0, 0))
         )
-        self.protocol.enable_touch_workaround(self.version)
-        if self.version >= (4, 0, 0):
-            self.protocol.apdu_format = ApduFormat.EXTENDED
+        self.protocol.configure(self.version)
+
+        try:
+            self._management_key_type = self.get_management_key_metadata().key_type
+        except NotSupportedError:
+            self._management_key_type = MANAGEMENT_KEY_TYPE.TDES
         self._current_pin_retries = 3
         self._max_pin_retries = 3
         logger.debug(f"PIV session initialized (version={self.version})")
 
     @property
     def version(self) -> Version:
+        """The version of the PIV application,
+        typically the same as the YubiKey firmware."""
         return self._version
 
+    @property
+    def management_key_type(self) -> MANAGEMENT_KEY_TYPE:
+        """The algorithm of the management key currently in use."""
+        return self._management_key_type
+
     def reset(self) -> None:
+        """Factory reset the PIV application data.
+
+        This deletes all user-data from the PIV application, and resets the default
+        values for PIN, PUK, and management key.
+        """
         logger.debug("Preparing PIV reset")
 
         try:
@@ -544,17 +739,55 @@ class PivSession:
         self._current_pin_retries = 3
         self._max_pin_retries = 3
 
+        # Update management key type
+        try:
+            self._management_key_type = self.get_management_key_metadata().key_type
+        except NotSupportedError:
+            self._management_key_type = MANAGEMENT_KEY_TYPE.TDES
+
         logger.info("PIV application data reset performed")
 
+    def get_serial(self) -> int:
+        """Get the serial number of the YubiKey."""
+        logger.debug("Getting serial number")
+        require_version(self.version, (5, 0, 3))
+        response = self.protocol.send_apdu(0, INS_GET_SERIAL, 0, 0)
+        return bytes2int(response)
+
+    @overload
+    def authenticate(self, management_key: bytes) -> None: ...
+
+    @overload
+    # TODO: remove in 6.0
     def authenticate(
         self, key_type: MANAGEMENT_KEY_TYPE, management_key: bytes
-    ) -> None:
+    ) -> None: ...
+
+    def authenticate(self, *args, **kwargs) -> None:
         """Authenticate to PIV with management key.
 
-        :param key_type: The management key type.
-        :param management_key: The management key in raw bytes.
+        :param bytes management_key: The management key in raw bytes.
         """
-        key_type = MANAGEMENT_KEY_TYPE(key_type)
+        key_type = kwargs.get("key_type")
+        management_key = kwargs.get("management_key")
+        if len(args) == 2:
+            key_type, management_key = args
+        elif len(args) == 1:
+            management_key = args[0]
+        else:
+            key_type = kwargs.get("key_type")
+            management_key = kwargs.get("management_key")
+        if key_type:
+            warnings.warn(
+                "Deprecated: call authenticate() without passing management_key_type.",
+                DeprecationWarning,
+            )
+            if self.management_key_type != key_type:
+                raise ValueError("Incorrect management key type")
+        if not isinstance(management_key, bytes):
+            raise TypeError("management_key must be bytes")
+
+        key_type = self.management_key_type
         logger.debug(f"Authenticating with key type: {key_type}")
         response = self.protocol.send_apdu(
             0,
@@ -568,7 +801,7 @@ class PivSession:
 
         backend = default_backend()
         cipher_key = _parse_management_key(key_type, management_key)
-        cipher = Cipher(cipher_key, modes.ECB(), backend)  # nosec
+        cipher = Cipher(cipher_key, modes.ECB(), backend)  # noqa: S305
         decryptor = cipher.decryptor()
         decrypted = decryptor.update(witness) + decryptor.finalize()
 
@@ -615,10 +848,11 @@ class PivSession:
             0xFE if require_touch else 0xFF,
             int2bytes(key_type) + Tlv(SLOT_CARD_MANAGEMENT, management_key),
         )
+        self._management_key_type = key_type
         logger.info("Management key set")
 
     def verify_pin(self, pin: str) -> None:
-        """Verify the PIN.
+        """Verify the user by PIN.
 
         :param pin: The PIN.
         """
@@ -633,10 +867,35 @@ class PivSession:
             self._current_pin_retries = retries
             raise InvalidPinError(retries)
 
-    def verify_uv(self) -> bytes:
+    def verify_uv(
+        self, temporary_pin: bool = False, check_only: bool = False
+    ) -> bytes | None:
+        """Verify the user by fingerprint (YubiKey Bio only).
+
+        Fingerprint verification will allow usage of private keys which have a PIN
+        policy allowing MATCH. For those using MATCH_ALWAYS, the fingerprint must be
+        verified just prior to using the key, or by first requesting a temporary PIN
+        and then later verifying the PIN just prior to key use.
+
+        :param temporary_pin: Request a temporary PIN for later use within the session.
+        :param check_only: Do not verify the user, instead immediately throw an
+            InvalidPinException containing the number of remaining attempts.
+        """
         logger.debug("Verifying UV")
+        if temporary_pin and check_only:
+            raise ValueError(
+                "Cannot request temporary PIN when doing check-only verification"
+            )
+
+        if check_only:
+            data = b""
+        elif temporary_pin:
+            data = Tlv(2)
+        else:
+            data = Tlv(3)
+
         try:
-            return self.protocol.send_apdu(0, INS_VERIFY, 0, SLOT_OCC_AUTH)
+            response = self.protocol.send_apdu(0, INS_VERIFY, 0, SLOT_OCC_AUTH, data)
         except ApduError as e:
             if e.sw == SW.REFERENCE_DATA_NOT_FOUND:
                 raise NotSupportedError(
@@ -648,8 +907,13 @@ class PivSession:
             raise InvalidPinError(
                 retries, f"Fingerprint mismatch, {retries} attempts remaining"
             )
+        return response if temporary_pin else None
 
     def verify_temporary_pin(self, pin: bytes) -> None:
+        """Verify the user via temporary PIN.
+
+        :param pin: A temporary PIN previously requested via verify_uv.
+        """
         logger.debug("Verifying temporary PIN")
         if len(pin) != TEMPORARY_PIN_LEN:
             raise ValueError(f"Temporary PIN must be exactly {TEMPORARY_PIN_LEN} bytes")
@@ -703,8 +967,13 @@ class PivSession:
         :param new_puk: The new PUK.
         """
         logger.debug("Changing PUK")
-        self._change_reference(INS_CHANGE_REFERENCE, PUK_P2, old_puk, new_puk)
-        logger.info("New PUK set")
+        try:
+            self._change_reference(INS_CHANGE_REFERENCE, PUK_P2, old_puk, new_puk)
+            logger.info("New PUK set")
+        except ApduError as e:
+            if e.sw == SW.INVALID_INSTRUCTION:
+                raise NotSupportedError("Setting PUK is not supported on this YubiKey")
+            raise
 
     def unblock_pin(self, puk: str, new_pin: str) -> None:
         """Reset PIN with PUK.
@@ -713,8 +982,15 @@ class PivSession:
         :param new_pin: The new PIN.
         """
         logger.debug("Using PUK to set new PIN")
-        self._change_reference(INS_RESET_RETRY, PIN_P2, puk, new_pin)
-        logger.info("New PIN set")
+        try:
+            self._change_reference(INS_RESET_RETRY, PIN_P2, puk, new_pin)
+            logger.info("New PIN set")
+        except ApduError as e:
+            if e.sw == SW.INVALID_INSTRUCTION:
+                raise NotSupportedError(
+                    "Unblocking PIN is not supported on this YubiKey"
+                )
+            raise
 
     def set_pin_attempts(self, pin_attempts: int, puk_attempts: int) -> None:
         """Set PIN retries for PIN and PUK.
@@ -782,6 +1058,12 @@ class PivSession:
         )
 
     def get_bio_metadata(self) -> BioMetadata:
+        """Get YubiKey Bio metadata.
+
+        This tells you if fingerprints are enrolled or not, how many fingerprint
+        verification attempts remain, and whether or not a temporary PIN is currently
+        active.
+        """
         logger.debug("Getting bio metadata")
         try:
             data = Tlv.parse_dict(
@@ -804,8 +1086,8 @@ class PivSession:
         slot: SLOT,
         key_type: KEY_TYPE,
         message: bytes,
-        hash_algorithm: hashes.HashAlgorithm,
-        padding: Optional[AsymmetricPadding] = None,
+        hash_algorithm: hashes.HashAlgorithm | None,
+        padding: AsymmetricPadding | None = None,
     ) -> bytes:
         """Sign message with key.
 
@@ -843,8 +1125,8 @@ class PivSession:
         except AttributeError:
             raise ValueError("Invalid length of ciphertext")
         logger.debug(
-            f"Decrypting data with key in slot {slot} of type {key_type} using ",
-            f"padding={padding}",
+            f"Decrypting data with key in slot {slot} of type {key_type} using "
+            f"padding={padding}"
         )
         padded = self._use_private_key(slot, key_type, cipher_text, False)
         return _unpad_message(padded, padding)
@@ -852,9 +1134,9 @@ class PivSession:
     def calculate_secret(
         self,
         slot: SLOT,
-        peer_public_key: Union[
-            ec.EllipticCurvePrivateKeyWithSerialization, x25519.X25519PublicKey
-        ],
+        peer_public_key: (
+            ec.EllipticCurvePublicKeyWithSerialization | x25519.X25519PublicKey
+        ),
     ) -> bytes:
         """Calculate shared secret using ECDH.
 
@@ -905,7 +1187,7 @@ class PivSession:
         except ValueError as e:
             raise BadResponseError("Malformed object data", e)
 
-    def put_object(self, object_id: int, data: Optional[bytes] = None) -> None:
+    def put_object(self, object_id: int, data: bytes | None = None) -> None:
         """Write data to PIV object.
 
         Requires authentication with management key.
@@ -937,9 +1219,12 @@ class PivSession:
             raise BadResponseError("Malformed certificate data object")
 
         if cert_info == 1:
-            logger.debug("Certificate is compressed, decompressing...")
             # Compressed certificate
-            cert_data = gzip.decompress(cert_data)
+            logger.debug("Certificate is compressed, decompressing...")
+            try:
+                cert_data = gzip.decompress(cert_data)
+            except gzip.BadGzipFile:
+                raise BadResponseError("Unable to decompress certificate")
         elif cert_info != 0:
             raise NotSupportedError("Unsupported value in CertInfo")
 
@@ -991,13 +1276,10 @@ class PivSession:
     def put_key(
         self,
         slot: SLOT,
-        private_key: Union[
-            rsa.RSAPrivateKeyWithSerialization,
-            ec.EllipticCurvePrivateKeyWithSerialization,
-        ],
+        private_key: PrivateKey,
         pin_policy: PIN_POLICY = PIN_POLICY.DEFAULT,
         touch_policy: TOUCH_POLICY = TOUCH_POLICY.DEFAULT,
-    ) -> None:
+    ) -> KEY_TYPE:
         """Import a private key to slot.
 
         Requires authentication with management key.
@@ -1009,9 +1291,10 @@ class PivSession:
         """
         slot = SLOT(slot)
         key_type = KEY_TYPE.from_public_key(private_key.public_key())
-        check_key_support(self.version, key_type, pin_policy, touch_policy, False)
+        self.check_key_support(key_type, pin_policy, touch_policy, False)
         ln = key_type.bit_len // 8
         if key_type.algorithm == ALGORITHM.RSA:
+            assert isinstance(private_key, rsa.RSAPrivateKey)  # noqa: S101
             numbers = private_key.private_numbers()
             numbers = cast(rsa.RSAPrivateNumbers, numbers)
             if numbers.public_numbers.e != 65537:
@@ -1032,6 +1315,7 @@ class PivSession:
                 ),
             )
         else:
+            assert isinstance(private_key, ec.EllipticCurvePrivateKey)  # noqa: S101
             numbers = private_key.private_numbers()
             numbers = cast(ec.EllipticCurvePrivateNumbers, numbers)
             data = Tlv(0x06, int2bytes(numbers.private_value, ln))
@@ -1053,7 +1337,7 @@ class PivSession:
         key_type: KEY_TYPE,
         pin_policy: PIN_POLICY = PIN_POLICY.DEFAULT,
         touch_policy: TOUCH_POLICY = TOUCH_POLICY.DEFAULT,
-    ) -> Union[rsa.RSAPublicKey, ec.EllipticCurvePublicKey]:
+    ) -> PublicKey:
         """Generate private key in slot.
 
         Requires authentication with management key.
@@ -1065,7 +1349,7 @@ class PivSession:
         """
         slot = SLOT(slot)
         key_type = KEY_TYPE(key_type)
-        check_key_support(self.version, key_type, pin_policy, touch_policy, True)
+        self.check_key_support(key_type, pin_policy, touch_policy, True)
         data: bytes = Tlv(TAG_GEN_ALGORITHM, int2bytes(key_type))
         if pin_policy:
             data += Tlv(TAG_PIN_POLICY, int2bytes(pin_policy))
@@ -1180,3 +1464,34 @@ class PivSession:
             if e.sw == SW.INCORRECT_PARAMETERS:
                 raise e  # TODO: Different error, No key?
             raise
+
+    def check_key_support(
+        self,
+        key_type: KEY_TYPE,
+        pin_policy: PIN_POLICY,
+        touch_policy: TOUCH_POLICY,
+        generate: bool,
+        fips_restrictions: bool = False,
+    ) -> None:
+        """Check if a key type is supported by this YubiKey.
+
+        This method will return None if the key (with PIN and touch policies) is
+        supported, or it will raise a NotSupportedError if it is not.
+
+        Set the generate parameter to True to check if generating the key is supported
+        (in addition to importing).
+
+        Set fips_restrictions to True to apply restrictions based on FIPS status.
+        """
+
+        _do_check_key_support(
+            self.version,
+            key_type,
+            pin_policy,
+            touch_policy,
+            generate,
+            fips_restrictions,
+        )
+
+        if pin_policy in (PIN_POLICY.MATCH_ONCE, PIN_POLICY.MATCH_ALWAYS):
+            self.get_bio_metadata()

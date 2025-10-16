@@ -25,29 +25,37 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from .core import (
-    int2bytes,
-    bytes2int,
-    require_version,
-    Version,
-    Tlv,
-    InvalidPinError,
-)
-from .core.smartcard import AID, SmartCardConnection, SmartCardProtocol, ApduError, SW
+from __future__ import annotations
+
+import logging
+import struct
+from dataclasses import dataclass
+from enum import IntEnum, unique
+from functools import total_ordering
+from typing import NamedTuple
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-
-from functools import total_ordering
-from enum import IntEnum, unique
-from dataclasses import dataclass
-from typing import Optional, List, Union, Tuple, NamedTuple
-import struct
-
-import logging
+from .core import (
+    InvalidPinError,
+    Tlv,
+    Version,
+    _override_version,
+    bytes2int,
+    int2bytes,
+    require_version,
+)
+from .core.smartcard import (
+    AID,
+    SW,
+    ApduError,
+    ScpKeyParams,
+    SmartCardConnection,
+    SmartCardProtocol,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,11 +108,12 @@ class ALGORITHM(IntEnum):
     EC_P256_YUBICO_AUTHENTICATION = 39
 
     @property
-    def key_len(self):
+    def key_len(self) -> int:
         if self.name.startswith("AES128"):
             return 16
         elif self.name.startswith("EC_P256"):
             return 32
+        raise ValueError("Unknown algorithm")
 
     @property
     def pubkey_len(self):
@@ -112,7 +121,7 @@ class ALGORITHM(IntEnum):
             return 64
 
 
-def _parse_credential_password(credential_password: Union[bytes, str]) -> bytes:
+def _parse_credential_password(credential_password: bytes | str) -> bytes:
     if isinstance(credential_password, str):
         pw = credential_password.encode().ljust(CREDENTIAL_PASSWORD_LEN, b"\0")
     else:
@@ -144,7 +153,7 @@ def _parse_select(response):
     return Version.from_bytes(data)
 
 
-def _password_to_key(password: str) -> Tuple[bytes, bytes]:
+def _password_to_key(password: str) -> tuple[bytes, bytes]:
     """Derive encryption and MAC key from a password.
 
     :return: A tuple containing the encryption key, and MAC key.
@@ -176,7 +185,7 @@ class Credential:
     label: str
     algorithm: ALGORITHM
     counter: int
-    touch_required: Optional[bool]
+    touch_required: bool | None
 
     def __lt__(self, other):
         a = self.label.lower()
@@ -198,7 +207,7 @@ class SessionKeys(NamedTuple):
     key_srmac: bytes
 
     @classmethod
-    def parse(cls, response: bytes) -> "SessionKeys":
+    def parse(cls, response: bytes) -> SessionKeys:
         key_senc = response[:16]
         key_smac = response[16:32]
         key_srmac = response[32:48]
@@ -213,9 +222,19 @@ class SessionKeys(NamedTuple):
 class HsmAuthSession:
     """A session with the YubiHSM Auth application."""
 
-    def __init__(self, connection: SmartCardConnection) -> None:
+    def __init__(
+        self,
+        connection: SmartCardConnection,
+        scp_key_params: ScpKeyParams | None = None,
+    ) -> None:
         self.protocol = SmartCardProtocol(connection)
-        self._version = _parse_select(self.protocol.select(AID.HSMAUTH))
+        self._version = _override_version.patch(
+            _parse_select(self.protocol.select(AID.HSMAUTH))
+        )
+
+        self.protocol.configure(self._version)
+        if scp_key_params:
+            self.protocol.init_scp(scp_key_params)
 
     @property
     def version(self) -> Version:
@@ -227,7 +246,7 @@ class HsmAuthSession:
         self.protocol.send_apdu(0, INS_RESET, 0xDE, 0xAD)
         logger.info("YubiHSM Auth application data reset performed")
 
-    def list_credentials(self) -> List[Credential]:
+    def list_credentials(self) -> list[Credential]:
         """List YubiHSM Auth credentials on YubiKey"""
 
         creds = []
@@ -248,7 +267,7 @@ class HsmAuthSession:
         label: str,
         key: bytes,
         algorithm: ALGORITHM,
-        credential_password: Union[bytes, str],
+        credential_password: bytes | str,
         touch_required: bool = False,
     ) -> Credential:
         if len(management_key) != MANAGEMENT_KEY_LEN:
@@ -300,7 +319,7 @@ class HsmAuthSession:
         label: str,
         key_enc: bytes,
         key_mac: bytes,
-        credential_password: Union[bytes, str],
+        credential_password: bytes | str,
         touch_required: bool = False,
     ) -> Credential:
         """Import a symmetric YubiHSM Auth credential.
@@ -334,7 +353,7 @@ class HsmAuthSession:
         management_key: bytes,
         label: str,
         derivation_password: str,
-        credential_password: Union[bytes, str],
+        credential_password: bytes | str,
         touch_required: bool = False,
     ) -> Credential:
         """Import a symmetric YubiHSM Auth credential derived from password.
@@ -358,7 +377,7 @@ class HsmAuthSession:
         management_key: bytes,
         label: str,
         private_key: ec.EllipticCurvePrivateKeyWithSerialization,
-        credential_password: Union[bytes, str],
+        credential_password: bytes | str,
         touch_required: bool = False,
     ) -> Credential:
         """Import an asymmetric YubiHSM Auth credential.
@@ -392,7 +411,7 @@ class HsmAuthSession:
         self,
         management_key: bytes,
         label: str,
-        credential_password: Union[bytes, str],
+        credential_password: bytes | str,
         touch_required: bool = False,
     ) -> Credential:
         """Generate an asymmetric YubiHSM Auth credential.
@@ -504,9 +523,9 @@ class HsmAuthSession:
         self,
         label: str,
         context: bytes,
-        credential_password: Union[bytes, str],
-        card_crypto: Optional[bytes] = None,
-        public_key: Optional[bytes] = None,
+        credential_password: bytes | str,
+        card_crypto: bytes | None = None,
+        public_key: bytes | None = None,
     ) -> bytes:
         data = Tlv(TAG_LABEL, _parse_label(label)) + Tlv(TAG_CONTEXT, context)
 
@@ -538,8 +557,8 @@ class HsmAuthSession:
         self,
         label: str,
         context: bytes,
-        credential_password: Union[bytes, str],
-        card_crypto: Optional[bytes] = None,
+        credential_password: bytes | str,
+        card_crypto: bytes | None = None,
     ) -> SessionKeys:
         """Calculate session keys from a symmetric YubiHSM Auth credential.
 
@@ -564,7 +583,7 @@ class HsmAuthSession:
         label: str,
         context: bytes,
         public_key: ec.EllipticCurvePublicKey,
-        credential_password: Union[bytes, str],
+        credential_password: bytes | str,
         card_crypto: bytes,
     ) -> SessionKeys:
         """Calculate session keys from an asymmetric YubiHSM Auth credential.
@@ -599,14 +618,27 @@ class HsmAuthSession:
             )
         )
 
-    def get_challenge(self, label: str) -> bytes:
+    def get_challenge(
+        self, label: str, credential_password: bytes | str | None = None
+    ) -> bytes:
         """Get the Host Challenge.
 
-        For symmetric credentials this is Host Challenge, a random
-        8 byte value. For asymmetric credentials this is EPK-OCE.
+        For symmetric credentials this is Host Challenge, a random 8 byte value.
+        For asymmetric credentials this is EPK-OCE.
 
         :param label: The label of the credential.
+        :param credential_password: The password used to protect access to the
+            credential, needed for asymmetric credentials.
         """
         require_version(self.version, (5, 6, 0))
-        data = Tlv(TAG_LABEL, _parse_label(label))
+
+        data: bytes = Tlv(TAG_LABEL, _parse_label(label))
+
+        if credential_password is not None and (
+            self.version >= (5, 7, 1) or self.version[0] == 0
+        ):
+            data += Tlv(
+                TAG_CREDENTIAL_PASSWORD, _parse_credential_password(credential_password)
+            )
+
         return self.protocol.send_apdu(0, INS_GET_CHALLENGE, 0, 0, data)

@@ -25,31 +25,33 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from .core import (
-    TRANSPORT,
-    Version,
-    bytes2int,
-    require_version,
-    NotSupportedError,
-    BadResponseError,
-)
-from .core import ApplicationNotAvailableError
-from .core.otp import (
-    check_crc,
-    calculate_crc,
-    OtpConnection,
-    OtpProtocol,
-    CommandRejectedError,
-)
-from .core.smartcard import AID, SmartCardConnection, SmartCardProtocol
-
 import abc
+import logging
 import struct
+import warnings
+from enum import IntEnum, IntFlag, unique
 from hashlib import sha1
 from threading import Event
-from enum import unique, IntEnum, IntFlag
-from typing import TypeVar, Optional, Union, Callable
-import logging
+from typing import Callable, TypeVar
+
+from .core import (
+    TRANSPORT,
+    ApplicationNotAvailableError,
+    BadResponseError,
+    NotSupportedError,
+    Version,
+    _override_version,
+    bytes2int,
+    require_version,
+)
+from .core.otp import (
+    CommandRejectedError,
+    OtpConnection,
+    OtpProtocol,
+    calculate_crc,
+    check_crc,
+)
+from .core.smartcard import AID, ScpKeyParams, SmartCardConnection, SmartCardProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -302,7 +304,7 @@ class CFGSTATE(IntFlag):
 
 def _shorten_hmac_key(key: bytes) -> bytes:
     if len(key) > SHA1_BLOCK_SIZE:
-        key = sha1(key).digest()  # nosec
+        key = sha1(key).digest()  # noqa: S324
     elif len(key) > HMAC_KEY_SIZE:
         raise NotSupportedError(f"Key lengths > {HMAC_KEY_SIZE} bytes not supported")
     return key
@@ -329,7 +331,7 @@ class SlotConfiguration:
     def is_supported_by(self, version: Version) -> bool:
         return True
 
-    def get_config(self, acc_code: Optional[bytes] = None) -> bytes:
+    def get_config(self, acc_code: bytes | None = None) -> bytes:
         return _build_config(
             self._fixed,
             self._uid,
@@ -380,7 +382,7 @@ class HmacSha1SlotConfiguration(SlotConfiguration):
         self._update_flags(CFGFLAG.HMAC_LT64, True)
 
     def is_supported_by(self, version):
-        return version >= (2, 2, 0) or version[0] == 0
+        return version >= (2, 2, 0)
 
     def require_touch(self: Cfg, value: bool) -> Cfg:
         self._update_flags(CFGFLAG.CHAL_BTN_TRIG, value)
@@ -429,7 +431,7 @@ class HotpSlotConfiguration(KeyboardSlotConfiguration):
         self._update_flags(CFGFLAG.OATH_FIXED_MODHEX2, True)
 
     def is_supported_by(self, version):
-        return version >= (2, 2, 0) or version[0] == 0
+        return version >= (2, 2, 0)
 
     def digits8(self: Cfg, value: bool) -> Cfg:
         self._update_flags(CFGFLAG.OATH_HOTP8, value)
@@ -474,7 +476,7 @@ class StaticPasswordSlotConfiguration(KeyboardSlotConfiguration):
         self._update_flags(CFGFLAG.SHORT_TICKET, True)
 
     def is_supported_by(self, version):
-        return version >= (2, 2, 0) or version[0] == 0
+        return version >= (2, 2, 0)
 
 
 class YubiOtpSlotConfiguration(KeyboardSlotConfiguration):
@@ -560,7 +562,7 @@ class UpdateConfiguration(KeyboardSlotConfiguration):
         self._key = b"\0" * KEY_SIZE
 
     def is_supported_by(self, version):
-        return version >= (2, 2, 0) or version[0] == 0
+        return version >= (2, 2, 0)
 
     def _update_flags(self, flag, value):
         # NB: All EXT flags are allowed
@@ -572,7 +574,7 @@ class UpdateConfiguration(KeyboardSlotConfiguration):
                 raise ValueError("Unsupported CFG flag for update")
         super(UpdateConfiguration, self)._update_flags(flag, value)
 
-    def protect_slot2(self: Cfg, value):
+    def protect_slot2(self, value):
         raise ValueError("protect_slot2 cannot be applied to UpdateConfiguration")
 
     def tabs(
@@ -634,12 +636,10 @@ class ConfigState:
 
 class _Backend(abc.ABC):
     @abc.abstractmethod
-    def close(self) -> None:
-        ...
+    def close(self) -> None: ...
 
     @abc.abstractmethod
-    def write_update(self, slot: CONFIG_SLOT, data: bytes) -> bytes:
-        ...
+    def write_update(self, slot: CONFIG_SLOT, data: bytes) -> bytes: ...
 
     @abc.abstractmethod
     def send_and_receive(
@@ -647,10 +647,9 @@ class _Backend(abc.ABC):
         slot: CONFIG_SLOT,
         data: bytes,
         expected_len: int,
-        event: Optional[Event] = None,
-        on_keepalive: Optional[Callable[[int], None]] = None,
-    ) -> bytes:
-        ...
+        event: Event | None = None,
+        on_keepalive: Callable[[int], None] | None = None,
+    ) -> bytes: ...
 
 
 class _YubiOtpOtpBackend(_Backend):
@@ -709,11 +708,17 @@ class _YubiOtpSmartCardBackend(_Backend):
 class YubiOtpSession:
     """A session with the YubiOTP application."""
 
-    def __init__(self, connection: Union[OtpConnection, SmartCardConnection]):
+    def __init__(
+        self,
+        connection: OtpConnection | SmartCardConnection,
+        scp_key_params: ScpKeyParams | None = None,
+    ):
         if isinstance(connection, OtpConnection):
+            if scp_key_params:
+                raise ValueError("SCP can only be used with SmartCardConnection")
             otp_protocol = OtpProtocol(connection)
             self._status = otp_protocol.read_status()
-            self._version = otp_protocol.version
+            self._version = _override_version.patch(otp_protocol.version)
             self.backend: _Backend = _YubiOtpOtpBackend(otp_protocol)
         elif isinstance(connection, SmartCardConnection):
             card_protocol = SmartCardProtocol(connection)
@@ -733,8 +738,10 @@ class YubiOtpSession:
                 # NEO reports the highest of these two
                 self._version = max(mgmt_version, otp_version)
             else:
-                self._version = mgmt_version or otp_version
-            card_protocol.enable_touch_workaround(self._version)
+                self._version = _override_version.patch(mgmt_version or otp_version)
+            card_protocol.configure(self._version)
+            if scp_key_params:
+                card_protocol.init_scp(scp_key_params)
             self.backend = _YubiOtpSmartCardBackend(
                 card_protocol, self._version, self._status[3]
             )
@@ -747,10 +754,20 @@ class YubiOtpSession:
         )
 
     def close(self) -> None:
+        """Close the underlying connection.
+
+        :deprecated: call .close() on the underlying connection instead.
+        """
+        warnings.warn(
+            "Deprecated: call .close() on the underlying connection instead.",
+            DeprecationWarning,
+        )
         self.backend.close()
 
     @property
     def version(self) -> Version:
+        """The version of the Yubico OTP application,
+        typically the same as the YubiKey firmware."""
         return self._version
 
     def get_serial(self) -> int:
@@ -775,8 +792,8 @@ class YubiOtpSession:
         self,
         slot: SLOT,
         configuration: SlotConfiguration,
-        acc_code: Optional[bytes] = None,
-        cur_acc_code: Optional[bytes] = None,
+        acc_code: bytes | None = None,
+        cur_acc_code: bytes | None = None,
     ) -> None:
         """Write configuration to slot.
 
@@ -804,8 +821,8 @@ class YubiOtpSession:
         self,
         slot: SLOT,
         configuration: SlotConfiguration,
-        acc_code: Optional[bytes] = None,
-        cur_acc_code: Optional[bytes] = None,
+        acc_code: bytes | None = None,
+        cur_acc_code: bytes | None = None,
     ) -> None:
         """Update configuration in slot.
 
@@ -836,7 +853,7 @@ class YubiOtpSession:
         logger.debug("Swapping touch slots")
         self._write_config(CONFIG_SLOT.SWAP, b"", None)
 
-    def delete_slot(self, slot: SLOT, cur_acc_code: Optional[bytes] = None) -> None:
+    def delete_slot(self, slot: SLOT, cur_acc_code: bytes | None = None) -> None:
         """Delete configuration stored in slot.
 
         :param slot: The slot to delete the configuration in.
@@ -850,9 +867,7 @@ class YubiOtpSession:
             cur_acc_code,
         )
 
-    def set_scan_map(
-        self, scan_map: bytes, cur_acc_code: Optional[bytes] = None
-    ) -> None:
+    def set_scan_map(self, scan_map: bytes, cur_acc_code: bytes | None = None) -> None:
         """Update scan-codes on YubiKey.
 
         This updates the scan-codes (or keyboard presses) that the YubiKey
@@ -864,8 +879,8 @@ class YubiOtpSession:
     def set_ndef_configuration(
         self,
         slot: SLOT,
-        uri: Optional[str] = None,
-        cur_acc_code: Optional[bytes] = None,
+        uri: str | None = None,
+        cur_acc_code: bytes | None = None,
         ndef_type: NDEF_TYPE = NDEF_TYPE.URI,
     ) -> None:
         """Configure a slot to be used over NDEF (NFC).
@@ -887,8 +902,8 @@ class YubiOtpSession:
         self,
         slot: SLOT,
         challenge: bytes,
-        event: Optional[Event] = None,
-        on_keepalive: Optional[Callable[[int], None]] = None,
+        event: Event | None = None,
+        on_keepalive: Callable[[int], None] | None = None,
     ) -> bytes:
         """Perform a challenge-response operation using HMAC-SHA1.
 

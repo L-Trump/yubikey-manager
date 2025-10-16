@@ -25,16 +25,21 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from yubikit.core import Tlv
-from cryptography.hazmat.primitives.serialization import pkcs12
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.backends import default_backend
-from cryptography import x509
-from typing import Tuple
 import ctypes
-
 import logging
 
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.serialization import pkcs12
+
+from yubikit.core import Tlv, int2bytes
+from yubikit.core.smartcard import (
+    ApduError,
+    ApplicationNotAvailableError,
+    SmartCardConnection,
+    SmartCardProtocol,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +89,10 @@ def parse_private_key(data, password):
 
     # PKCS12
     if is_pkcs12(data):
-        return _parse_pkcs12(data, password)[0]
+        key = _parse_pkcs12(data, password)[0]
+        if not key:
+            raise ValueError("PKCS12 file does not contain a private key.")
+        return key
 
     # DER
     try:
@@ -145,16 +153,8 @@ def get_leaf_certificates(certs):
 
     :param certs: The list of cryptography x509 certificate objects.
     """
-    issuers = [
-        cert.issuer.get_attributes_for_oid(x509.NameOID.COMMON_NAME) for cert in certs
-    ]
-    leafs = [
-        cert
-        for cert in certs
-        if (
-            cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME) not in issuers
-        )
-    ]
+    issuers = [cert.issuer for cert in certs]
+    leafs = [cert for cert in certs if cert.subject not in issuers]
     return leafs
 
 
@@ -176,6 +176,13 @@ def is_pkcs12(data):
     return False
 
 
+def display_serial(serial: int) -> str:
+    """Displays an x509 certificate serial number in a readable format."""
+    if serial >= 0x10000000000000000:
+        return ":".join(f"{b:02x}" for b in int2bytes(serial, 20))
+    return f"{serial} ({hex(serial)})"
+
+
 class OSVERSIONINFOW(ctypes.Structure):
     _fields_ = [
         ("dwOSVersionInfoSize", ctypes.c_ulong),
@@ -187,9 +194,25 @@ class OSVERSIONINFOW(ctypes.Structure):
     ]
 
 
-def get_windows_version() -> Tuple[int, int, int]:
+def get_windows_version() -> tuple[int, int, int]:
     """Get the true Windows version, since sys.getwindowsversion lies."""
     osvi = OSVERSIONINFOW()
     osvi.dwOSVersionInfoSize = ctypes.sizeof(osvi)
     ctypes.windll.Ntdll.RtlGetVersion(ctypes.byref(osvi))  # type: ignore
     return osvi.dwMajorVersion, osvi.dwMinorVersion, osvi.dwBuildNumber
+
+
+_RESTRICTED_NDEF = bytes.fromhex("001FD1011B5504") + b"yubico.com/getting-started"
+
+
+def is_nfc_restricted(connection: SmartCardConnection) -> bool:
+    """Check if the given SmartCardConnection over NFC is in restricted NFC mode."""
+    try:
+        p = SmartCardProtocol(connection)
+        p.select(bytes.fromhex("D2760000850101"))
+        p.send_apdu(0x00, 0xA4, 0x00, 0x0C, bytes([0xE1, 0x04]))
+        ndef = p.send_apdu(0x00, 0xB0, 0x00, 0x00)
+    except (ApduError, ApplicationNotAvailableError):
+        ndef = None
+
+    return ndef == _RESTRICTED_NDEF

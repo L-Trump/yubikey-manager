@@ -25,7 +25,100 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from yubikit.openpgp import OpenPgpSession, KEY_REF, KdfNone
+import logging
+from datetime import datetime, timezone
+
+from yubikit.core.smartcard import (
+    AID,
+    SW,
+    ApduError,
+    SmartCardConnection,
+    SmartCardProtocol,
+)
+from yubikit.openpgp import (
+    _INVALID_PIN,
+    INS,
+    KEY_REF,
+    PW,
+    AlgorithmAttributes,
+    EcAttributes,
+    KdfNone,
+    OpenPgpSession,
+    RsaAttributes,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def safe_reset(connection: SmartCardConnection) -> None:
+    """Performs an OpenPGP factory reset while avoiding any unneccessary commands.
+
+    If any data is unreadable preventing the OpenPgpSession from initializing, then
+    OpenPgpSession.reset() will not be able to be called. This function can instead
+    be  used to reset the application into a fresh state.
+    """
+    logger.debug("Attempting safe OpenPGP factory reset")
+    protocol = SmartCardProtocol(connection)
+    protocol.select(AID.OPENPGP)
+
+    for pw in (PW.USER, PW.ADMIN):
+        logger.debug(f"Verify {pw.name} PIN with invalid attempts until blocked")
+        while True:
+            try:
+                protocol.send_apdu(0, INS.VERIFY, 0, pw, _INVALID_PIN)
+            except ApduError as e:
+                if e.sw == SW.SECURITY_CONDITION_NOT_SATISFIED:
+                    continue
+                # Either blocked, or an unexpected error, move to the next step
+                break
+
+    # Reset the application
+    logger.debug("Sending TERMINATE, then ACTIVATE")
+    protocol.send_apdu(0, INS.TERMINATE, 0, 0)
+    protocol.send_apdu(0, INS.ACTIVATE, 0, 0)
+    logger.info("OpenPGP application data reset performed")
+
+
+def _format_ref(ref: KEY_REF) -> str:
+    if ref == KEY_REF.SIG:
+        return "Signature key"
+    if ref == KEY_REF.DEC:
+        return "Decryption key"
+    if ref == KEY_REF.AUT:
+        return "Authentication key"
+    if ref == KEY_REF.ATT:
+        return "Attestation key"
+    return ref.name
+
+
+def _format_fingerprint(fp: bytes) -> str:
+    return "  ".join(
+        " ".join(fp[h * 10 + s * 2 :][:2].hex() for s in range(5)) for h in range(2)
+    ).upper()
+
+
+def _format_date(timestamp: int) -> str:
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+
+
+def _format_algorithm(alg: AlgorithmAttributes) -> str:
+    if isinstance(alg, RsaAttributes):
+        return f"RSA{alg.n_len}"
+    if isinstance(alg, EcAttributes):
+        return f"{alg.oid}"
+    return "Unknown key type"
+
+
+def get_key_info(discretionary, ref, status):
+    alg = discretionary.get_algorithm_attributes(ref)
+    return {
+        "Key slot": _format_ref(ref),
+        "Fingerprint": _format_fingerprint(discretionary.fingerprints[ref]),
+        "Algorithm": _format_algorithm(alg),
+        "Origin": status.name if status is not None else "UNKNOWN",
+        "Created": _format_date(discretionary.generation_times[ref]),
+        "Touch policy": discretionary.get_uif(ref),
+    }
 
 
 def get_openpgp_info(session: OpenPgpSession):
@@ -46,15 +139,17 @@ def get_openpgp_info(session: OpenPgpSession):
         "KDF enabled": not isinstance(session.get_kdf(), KdfNone),
     }
 
-    # Touch only available on YK4 and later
-    if session.version >= (4, 2, 6):
-        touch = {
-            "Signature key": session.get_uif(KEY_REF.SIG),
-            "Encryption key": session.get_uif(KEY_REF.DEC),
-            "Authentication key": session.get_uif(KEY_REF.AUT),
+    for ref, fp in discretionary.fingerprints.items():
+        if session.version >= (5, 2, 0):
+            if not discretionary.key_information[ref] or ref == KEY_REF.ATT:
+                continue
+        else:
+            if not any(fp):
+                continue
+
+        info[_format_ref(ref)] = {
+            "Fingerprint": _format_fingerprint(fp),
+            "Touch policy": discretionary.get_uif(ref),
         }
-        if discretionary.attributes_att is not None:
-            touch["Attestation key"] = session.get_uif(KEY_REF.ATT)
-        info["Touch policies"] = touch
 
     return info

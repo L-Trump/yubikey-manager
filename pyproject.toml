@@ -1,18 +1,51 @@
-[tool.poetry]
+[project]
 name = "canokey-manager"
-version = "5.4.0"
-description = "Tool for managing your CanoKey configuration."
-authors = ["Dain Nilsson <dain@yubico.com>", "Yuxiang Zhang <yuxiang.zhang@tuna.tsinghua.edu.cn>"]
-license = "BSD"
-homepage = "https://github.com/canokeys/yubikey-manager"
-repository = "https://github.com/canokeys/yubikey-manager"
-keywords = ["canokey", "piv", "fido"]
+version = "5.8.0"
+description = "Library and CLI for managing your Canokey configuration."
+authors = [
+  { name = "Dain Nilsson", email = "<dain@yubico.com>" }
+]
+readme = "README.adoc"
+requires-python = ">=3.10, <4"
+license = { file = "COPYING" }
+keywords = ["canokey", "yubiotp", "piv", "fido"]
 classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Intended Audience :: End Users/Desktop",
   "Topic :: Security :: Cryptography",
   "Topic :: Utilities"
 ]
+dependencies = [
+  "cryptography (>=3.0, <48)",
+  "pyscard (>=2.0, <3)",
+  "fido2 (>=2.0, <3)",
+  "click (>=8.0, <9)",
+  "keyring (>=23.4, <26)",
+  "pywin32 (>=223) ; sys_platform == 'win32'",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0,<9",
+    "makefun>=1.9.5,<2",
+    "pyinstaller>=6.10,<7",
+    "sphinx>=7.4,<8",
+    "sphinx-rtd-theme>=3,<4",
+    "sphinx-autoapi>=3.3.3,<4",
+]
+
+[project.urls]
+Homepage = "https://github.com/Yubico/yubikey-manager"
+
+[project.scripts]
+ckman = "ykman._cli.__main__:main"
+
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+requires-poetry = ">=2.0"
 include = [
   { path = "COPYING", format = "sdist"},
   { path = "NEWS", format = "sdist"},
@@ -25,30 +58,15 @@ packages = [
   { include = "ykman" },
 ]
 
-
-[tool.poetry.dependencies]
-python = "^3.8"
-cryptography = ">=3.0, <45"
-pyscard = "^2.0"
-fido2 = "^1.0"
-click = "^8.0"
-keyring = ">=23.4, <25"
-pywin32 = {version = ">=223", platform = "win32"}
-
-[tool.poetry.dev-dependencies]
-pytest = "^7.2"
-makefun = "^1.9.5"
-pyinstaller = {version = "^6.0", python = "<3.13"}
-Sphinx = "^7.1"
-sphinx-rtd-theme = "^1.2.2"
-sphinx-autodoc-typehints = "^1.2.4"
-
-[tool.poetry.scripts]
-ckman = "ykman._cli.__main__:main"
-
-[build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+extend-select = ["E", "I", "S"]
+exclude = ["tests/*"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+exclude = ["tests/", "docs/"]
+reportPrivateImportUsage = false

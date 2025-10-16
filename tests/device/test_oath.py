@@ -1,24 +1,33 @@
 import pytest
 
-from yubikit.core.smartcard import ApduError, AID, SW
+from yubikit.core import TRANSPORT
+from yubikit.core.smartcard import AID, SW, ApduError
 from yubikit.management import CAPABILITY
 from yubikit.oath import (
-    OathSession,
-    CredentialData,
     HASH_ALGORITHM,
     OATH_TYPE,
+    CredentialData,
+    OathSession,
 )
-from . import condition
 
+from . import condition
 
 KEY = bytes.fromhex("01020304050607080102030405060708")
 
 
 @pytest.fixture
 @condition.capability(CAPABILITY.OATH)
-def session(ccid_connection):
-    oath = OathSession(ccid_connection)
+def session(ccid_connection, info, scp_params):
+    fips = CAPABILITY.OATH in info.fips_capable
+    if ccid_connection.transport == TRANSPORT.NFC and fips:
+        oath = OathSession(ccid_connection, scp_params)
+    else:
+        oath = OathSession(ccid_connection)
     oath.reset()
+
+    if fips:
+        oath.set_key(KEY)
+
     yield oath
 
 
@@ -82,8 +91,7 @@ class TestLockPreventsAccess:
 
 
 HMAC_VECTORS = {
-    b"\x0B"
-    * 20: {
+    b"\x0b" * 20: {
         b"Hi There": {
             HASH_ALGORITHM.SHA256: bytes.fromhex(
                 "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
@@ -105,10 +113,8 @@ HMAC_VECTORS = {
             ),
         }
     },
-    b"\xAA"
-    * 20: {
-        b"\xDD"
-        * 50: {
+    b"\xaa" * 20: {
+        b"\xdd" * 50: {
             HASH_ALGORITHM.SHA256: bytes.fromhex(
                 "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"
             ),
@@ -119,8 +125,7 @@ HMAC_VECTORS = {
         }
     },
     bytes.fromhex("0102030405060708090a0b0c0d0e0f10111213141516171819"): {
-        b"\xCD"
-        * 50: {
+        b"\xcd" * 50: {
             HASH_ALGORITHM.SHA256: bytes.fromhex(
                 "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b"
             ),

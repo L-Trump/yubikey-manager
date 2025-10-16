@@ -25,33 +25,40 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-import click
 import logging
+from typing import Any
+
+import click
+
+from yubikit.core import TRANSPORT
+from yubikit.core.smartcard import SW, ApduError, SmartCardConnection
+from yubikit.management import CAPABILITY
+from yubikit.oath import (
+    HASH_ALGORITHM,
+    OATH_TYPE,
+    CredentialData,
+    OathSession,
+    _format_cred_id,
+    parse_b32_key,
+)
+
+from ..oath import calculate_steam, delete_broken_credential, is_hidden, is_steam
+from ..settings import AppData
 from .util import (
     CliFail,
-    click_force_option,
-    click_postpone_execution,
+    EnumChoice,
     click_callback,
-    click_parse_b32_key,
-    click_prompt,
+    click_force_option,
     click_group,
+    click_parse_b32_key,
+    click_postpone_execution,
+    click_prompt,
+    get_scp_params,
+    is_yk4_fips,
+    pretty_print,
     prompt_for_touch,
     prompt_timeout,
-    EnumChoice,
-    is_yk4_fips,
 )
-from yubikit.core.smartcard import ApduError, SW, SmartCardConnection
-from yubikit.oath import (
-    OathSession,
-    CredentialData,
-    OATH_TYPE,
-    HASH_ALGORITHM,
-    parse_b32_key,
-    _format_cred_id,
-)
-from ..oath import is_steam, calculate_steam, is_hidden, delete_broken_credential
-from ..settings import AppData
-
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +89,15 @@ def oath(ctx):
     dev = ctx.obj["device"]
     conn = dev.open_connection(SmartCardConnection)
     ctx.call_on_close(conn.close)
-    ctx.obj["session"] = OathSession(conn)
+
+    scp_params = get_scp_params(ctx, CAPABILITY.OATH, conn)
+
+    ctx.obj["session"] = OathSession(conn, scp_params)
     ctx.obj["oath_keys"] = AppData("oath_keys")
+    info = ctx.obj["info"]
+    is_fips = CAPABILITY.OATH in info.fips_capable
+    ctx.obj["fips_unready"] = is_fips and CAPABILITY.OATH not in info.fips_approved
+    ctx.obj["no_scp"] = is_fips and dev.transport == TRANSPORT.NFC and not scp_params
 
 
 @oath.command()
@@ -93,16 +107,22 @@ def info(ctx):
     Display general status of the OATH application.
     """
     session = ctx.obj["session"]
-    version = session.version
-    click.echo(f"OATH version: {version[0]}.{version[1]}.{version[2]}")
-    click.echo("Password protection: " + ("enabled" if session.locked else "disabled"))
+    info = ctx.obj["info"]
+    data: dict[str, Any] = {"OATH version": "%d.%d.%d" % session.version}
+    lines: list[Any] = [data]
 
+    if CAPABILITY.OATH in info.fips_capable:
+        # This is a bit ugly as it makes assumptions about the structure of data
+        data["FIPS approved"] = CAPABILITY.OATH in info.fips_approved
+    elif is_yk4_fips(info):
+        data["FIPS approved"] = session.locked
+
+    data["Password protection"] = "enabled" if session.locked else "disabled"
     keys = ctx.obj["oath_keys"]
     if session.locked and session.device_id in keys:
-        click.echo("The password for this YubiKey is remembered by ykman.")
+        lines.append("The password for this YubiKey is remembered by ykman.")
 
-    if is_yk4_fips(ctx.obj["info"]):
-        click.echo(f"FIPS Approved Mode: {'Yes' if session.locked else 'No'}")
+    click.echo("\n".join(pretty_print(lines)))
 
 
 @oath.command()
@@ -116,12 +136,13 @@ def reset(ctx, force):
     the OATH application on the YubiKey.
     """
 
-    force or click.confirm(
-        "WARNING! This will delete all stored OATH accounts and restore factory "
-        "settings. Proceed?",
-        abort=True,
-        err=True,
-    )
+    if not force:
+        click.confirm(
+            "WARNING! This will delete all stored OATH accounts and restore factory "
+            "settings. Proceed?",
+            abort=True,
+            err=True,
+        )
 
     session = ctx.obj["session"]
     click.echo("Resetting OATH data...")
@@ -134,7 +155,7 @@ def reset(ctx, force):
         keys.write()
         logger.info("Deleted remembered access key")
 
-    click.echo("Success! All OATH accounts have been deleted from the YubiKey.")
+    click.echo("Reset complete. All OATH accounts have been deleted from the YubiKey.")
 
 
 click_password_option = click.option(
@@ -203,6 +224,12 @@ def _init_session(ctx, password, remember, prompt="Enter the password"):
         raise CliFail("Password provided, but no password is set.")
 
 
+def _fail_scp(ctx, e):
+    if ctx.obj["no_scp"] and e.sw == SW.CONDITIONS_NOT_SATISFIED:
+        raise CliFail("Unable to manage OATH over NFC without SCP")
+    raise e
+
+
 @oath.group()
 def access():
     """Manage password protection for OATH."""
@@ -226,8 +253,13 @@ def change(ctx, password, clear, new_password, remember):
     Allows you to set or change a password that will be required to access the OATH
     accounts stored on the YubiKey.
     """
-    if clear and new_password:
-        ctx.fail("--clear cannot be combined with --new-password.")
+    if clear:
+        if new_password:
+            raise CliFail("--clear cannot be combined with --new-password.")
+
+        info = ctx.obj["info"]
+        if CAPABILITY.OATH in info.fips_capable:
+            raise CliFail("Removing the password is not allowed on YubiKey FIPS.")
 
     _init_session(ctx, password, False, prompt="Enter the current password")
 
@@ -263,8 +295,11 @@ def change(ctx, password, clear, new_password, remember):
         elif device_id in keys:
             del keys[device_id]
             keys.write()
-        session.set_key(key)
-        click.echo("Password updated.")
+        try:
+            session.set_key(key)
+            click.echo("Password updated.")
+        except ApduError as e:
+            _fail_scp(ctx, e)
 
 
 @access.command()
@@ -297,6 +332,7 @@ def remember(ctx, password):
         key = session.derive_key(password)
         try:
             _validate(ctx, key, True)
+            click.echo("Password remembered.")
         except Exception:
             raise CliFail("Authentication to the YubiKey failed. Wrong password?")
 
@@ -453,6 +489,11 @@ def add(
     SECRET  base32-encoded secret/key value provided by the server
     """
 
+    if ctx.obj["fips_unready"]:
+        raise CliFail(
+            "YubiKey FIPS must be in FIPS approved mode prior to adding accounts"
+        )
+
     digits = int(digits)
 
     if not secret:
@@ -480,7 +521,7 @@ def add(
 def click_parse_uri(ctx, param, val):
     try:
         return CredentialData.parse_uri(val)
-    except ValueError:
+    except (ValueError, KeyError):
         raise click.BadParameter("URI seems to have the wrong format.")
 
 
@@ -497,6 +538,11 @@ def uri(ctx, data, touch, force, password, remember):
 
     Use a URI to add a new account to the YubiKey.
     """
+
+    if ctx.obj["fips_unready"]:
+        raise CliFail(
+            "YubiKey FIPS must be in FIPS approved mode prior to adding accounts"
+        )
 
     if not data:
         while True:
@@ -521,19 +567,19 @@ def _add_cred(ctx, data, touch, force):
     version = session.version
 
     if not (0 < len(data.name) <= 64):
-        ctx.fail("Name must be between 1 and 64 bytes.")
+        raise CliFail("Name must be between 1 and 64 bytes.")
 
     if len(data.secret) < 2:
-        ctx.fail("Secret must be at least 2 bytes.")
+        raise CliFail("Secret must be at least 2 bytes.")
 
-    if touch and version < (4, 2, 6):
+    if touch and not version >= (4, 2, 6):
         raise CliFail("Require touch is not supported on this YubiKey.")
 
     if data.counter and data.oath_type != OATH_TYPE.HOTP:
-        ctx.fail("Counter only supported for HOTP accounts.")
+        raise CliFail("Counter only supported for HOTP accounts.")
 
     if data.hash_algorithm == HASH_ALGORITHM.SHA512 and (
-        version < (4, 3, 1) or is_yk4_fips(ctx.obj["info"])
+        not version >= (4, 3, 1) or is_yk4_fips(ctx.obj["info"])
     ):
         raise CliFail("Algorithm SHA512 not supported on this YubiKey.")
 
@@ -558,24 +604,24 @@ def _add_cred(ctx, data, touch, force):
 
     try:
         session.put_credential(data, touch)
+        click.echo("OATH account added.")
     except ApduError as e:
         if e.sw == SW.NO_SPACE:
             raise CliFail("No space left on the YubiKey for OATH accounts.")
         elif e.sw == SW.COMMAND_ABORTED:
             # Some NEOs do not use the NO_SPACE error.
             raise CliFail("The command failed. Is there enough space on the YubiKey?")
-        else:
-            raise
+        _fail_scp(ctx, e)
 
 
-@accounts.command()
+@accounts.command("list")
 @click_show_hidden_option
 @click.pass_context
 @click.option("-o", "--oath-type", is_flag=True, help="display the OATH type")
 @click.option("-P", "--period", is_flag=True, help="display the period")
 @click_password_option
 @click_remember_option
-def list(ctx, show_hidden, oath_type, period, password, remember):
+def list_creds(ctx, show_hidden, oath_type, period, password, remember):
     """
     List all accounts.
 
@@ -640,49 +686,51 @@ def code(ctx, show_hidden, query, single, password, remember):
 
     if len(creds) == 1:
         cred = creds[0]
-        code = entries[cred]
+        # If we don't have a code, we need to calculate it.
         if cred.touch_required:
             prompt_for_touch()
         try:
-            if cred.oath_type == OATH_TYPE.HOTP:
-                with prompt_timeout():
-                    # HOTP might require touch, we don't know.
-                    # Assume yes after 500ms.
-                    code = session.calculate_code(cred)
-            elif code is None:
-                code = session.calculate_code(cred)
+            if is_steam(cred):
+                value = calculate_steam(session, cred)
+            elif entries[cred]:
+                value = entries[cred].value
+            else:
+                if cred.oath_type == OATH_TYPE.HOTP:
+                    with prompt_timeout():
+                        # HOTP might require touch, we don't know.
+                        # Assume yes after 500ms.
+                        value = session.calculate_code(cred).value
+                else:
+                    value = session.calculate_code(cred).value
         except ApduError as e:
             if e.sw == SW.SECURITY_CONDITION_NOT_SATISFIED:
                 raise CliFail("Touch account timed out!")
-        entries[cred] = code
-
-    elif single and len(creds) > 1:
-        _error_multiple_hits(ctx, creds)
-
-    elif single and len(creds) == 0:
-        raise CliFail("No matching account found.")
-
-    if single and creds:
-        if is_steam(cred):
-            click.echo(calculate_steam(session, cred))
+            raise
+        if single:
+            click.echo(value)
         else:
-            click.echo(code.value)
+            click.echo(f"{_string_id(cred)}  {value}")
+    elif single:
+        if creds:
+            _error_multiple_hits(ctx, creds)
+        else:
+            raise CliFail("No matching account found.")
     else:
         outputs = []
         for cred in sorted(creds):
             code = entries[cred]
             if code:
                 if is_steam(cred):
-                    code = calculate_steam(session, cred)
+                    codestr = calculate_steam(session, cred)
                 else:
-                    code = code.value
+                    codestr = code.value
             elif cred.touch_required:
-                code = "[Requires Touch]"
+                codestr = "[Requires Touch]"
             elif cred.oath_type == OATH_TYPE.HOTP:
-                code = "[HOTP Account]"
+                codestr = "[HOTP Account]"
             else:
-                code = ""
-            outputs.append((_string_id(cred), code))
+                codestr = ""
+            outputs.append((_string_id(cred), codestr))
 
         longest_name = max(len(n) for (n, c) in outputs) if outputs else 0
         longest_code = max(len(c) for (n, c) in outputs) if outputs else 0

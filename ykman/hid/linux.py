@@ -25,19 +25,20 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from yubikit.core.otp import OtpConnection
-from yubikit.logging import LOG_LEVEL
-from .base import OtpYubiKeyDevice, YUBICO_VID, USAGE_OTP
+import fcntl
+import glob
+import logging
+import struct
+import sys
 from typing import Set
 
-import glob
-import fcntl
-import struct
-import logging
-import sys
+from yubikit.core.otp import OtpConnection
+from yubikit.logging import LOG_LEVEL
+
+from .base import USAGE_OTP, YUBICO_VID, OtpYubiKeyDevice
 
 # Don't typecheck this file on Windows
-assert sys.platform != "win32"  # nosec
+assert sys.platform != "win32"  # noqa: S101
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ class HidrawConnection(OtpConnection):
     def receive(self):
         buf = bytearray(1 + 8)
         fcntl.ioctl(self.handle, USB_GET_REPORT, buf, True)
-        data = buf[1:]
+        data = bytes(buf[1:])
         logger.log(LOG_LEVEL.TRAFFIC, "RECV: %s", data.hex())
         return data
 

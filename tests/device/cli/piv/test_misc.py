@@ -1,8 +1,6 @@
-from yubikit.piv import OBJECT_ID
 import pytest
 
-
-DEFAULT_MANAGEMENT_KEY = "010203040506070801020304050607080102030405060708"
+from yubikit.piv import OBJECT_ID
 
 
 class TestMisc:
@@ -15,9 +13,9 @@ class TestMisc:
 
     def test_reset(self, ykman_cli):
         output = ykman_cli("piv", "reset", "-f").output
-        assert "Success!" in output
+        assert "Reset complete" in output
 
-    def test_export_invalid_certificate_fails(self, ykman_cli):
+    def test_export_invalid_certificate_fails(self, ykman_cli, keys):
         ykman_cli(
             "piv",
             "objects",
@@ -25,7 +23,7 @@ class TestMisc:
             hex(OBJECT_ID.AUTHENTICATION),
             "-",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             input="This is not a cert",
         )
 
@@ -34,7 +32,7 @@ class TestMisc:
                 "piv", "certificates", "export", hex(OBJECT_ID.AUTHENTICATION), "-"
             )
 
-    def test_info_with_invalid_certificate_does_not_crash(self, ykman_cli):
+    def test_info_with_invalid_certificate_does_not_crash(self, ykman_cli, keys):
         ykman_cli(
             "piv",
             "objects",
@@ -42,7 +40,7 @@ class TestMisc:
             hex(OBJECT_ID.AUTHENTICATION),
             "-",
             "-m",
-            DEFAULT_MANAGEMENT_KEY,
+            keys.mgmt,
             input="This is not a cert",
         )
         ykman_cli("piv", "info")

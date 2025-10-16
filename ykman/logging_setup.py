@@ -25,17 +25,18 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from ykman import __version__ as ykman_version
-from ykman.util import get_windows_version
-from ykman.logging import init_logging
-from yubikit.logging import LOG_LEVEL
-from datetime import datetime
-import platform
-import logging
 import ctypes
-import sys
+import logging
 import os
+import platform
+import sys
+import warnings
+from datetime import datetime
 
+from ykman import __version__ as ykman_version
+from ykman.logging import init_logging
+from ykman.util import get_windows_version
+from yubikit.logging import LOG_LEVEL
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,11 @@ def log_sys_info(log):
 
 
 def setup(log_level_name, log_file=None):
-    log_level = LOG_LEVEL[log_level_name.upper()]
-    init_logging(log_level, log_file=log_file)
+    warnings.warn(
+        "logging_setup.setup is deprecated, use logging.init_loging instead",
+        DeprecationWarning,
+    )
 
+    log_level = LOG_LEVEL[log_level_name.upper()]
+    init_logging(log_level, log_file=log_file, replace=log_file is None)
     log_sys_info(logger.debug)

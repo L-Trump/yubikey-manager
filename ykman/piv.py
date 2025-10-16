@@ -25,36 +25,48 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+from __future__ import annotations
 
-from yubikit.core import Tlv, BadResponseError, NotSupportedError
-from yubikit.core.smartcard import ApduError, SW
-from yubikit.piv import (
-    PivSession,
-    SLOT,
-    OBJECT_ID,
-    KEY_TYPE,
-    MANAGEMENT_KEY_TYPE,
-    ALGORITHM,
-    TAG_LRC,
-    SlotMetadata,
-)
+import logging
+import os
+import re
+import struct
+from datetime import date, datetime
+from typing import TYPE_CHECKING, Any, Mapping, TypeAlias, cast
+from uuid import uuid4
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding, ed25519, x25519
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa, x25519
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.x509.oid import NameOID
-from datetime import datetime
-import logging
-import struct
-import os
-import re
 
-from typing import Union, Mapping, Optional, List, Dict, Type, Any, cast
+from yubikit.core import BadResponseError, NotSupportedError, Tlv
+from yubikit.core.smartcard import SW, ApduError
+from yubikit.piv import (
+    ALGORITHM,
+    KEY_TYPE,
+    MANAGEMENT_KEY_TYPE,
+    OBJECT_ID,
+    SLOT,
+    TAG_LRC,
+    Chuid,
+    FascN,
+    PivSession,
+    SlotMetadata,
+)
 
+from .util import display_serial
+
+if TYPE_CHECKING:
+    # These types arent't available on cryptography <40.
+    from cryptography.hazmat.primitives.asymmetric.types import (
+        CertificatePublicKeyTypes,
+        PublicKeyTypes,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +91,7 @@ _NAME_ATTRIBUTES = {
 _ESCAPED = "\\\"+,'<> #="
 
 
-def _parse(value: str) -> List[List[str]]:
+def _parse(value: str) -> list[list[str]]:
     remaining = list(value)
     name = []
     entry = []
@@ -125,7 +137,7 @@ def parse_rfc4514_string(value: str) -> x509.Name:
     :param value: An RFC 4514 string.
     """
     name = _parse(value)
-    attributes: List[x509.RelativeDistinguishedName] = []
+    attributes: list[x509.RelativeDistinguishedName] = []
     for entry in name:
         parts = []
         for part in entry:
@@ -167,7 +179,7 @@ def derive_management_key(pin: str, salt: bytes) -> bytes:
     :param pin: The PIN.
     :param salt: The salt.
     """
-    kdf = PBKDF2HMAC(hashes.SHA1(), 24, salt, 10000, default_backend())  # nosec
+    kdf = PBKDF2HMAC(hashes.SHA1(), 24, salt, 10000, default_backend())  # noqa: S303
     return kdf.derive(pin.encode("utf-8"))
 
 
@@ -231,7 +243,7 @@ class PivmanData:
             data += Tlv(0x82, self.salt)
         if self.pin_timestamp is not None:
             data += Tlv(0x83, struct.pack(">I", self.pin_timestamp))
-        return Tlv(0x80, data)
+        return Tlv(0x80, data) if data else b""
 
 
 class PivmanProtectedData:
@@ -243,7 +255,7 @@ class PivmanProtectedData:
         data = b""
         if self.key is not None:
             data += Tlv(0x89, self.key)
-        return Tlv(0x88, data)
+        return Tlv(0x88, data) if data else b""
 
 
 def get_pivman_data(session: PivSession) -> PivmanData:
@@ -278,6 +290,10 @@ def get_pivman_protected_data(session: PivSession) -> PivmanProtectedData:
             logger.debug("No data, initializing blank")
             return PivmanProtectedData()
         raise
+    except Exception:
+        raise ValueError(
+            f"Invalid data in protected slot ({hex(OBJECT_ID_PIVMAN_PROTECTED_DATA)})"
+        )
 
 
 def pivman_set_mgm_key(
@@ -296,6 +312,7 @@ def pivman_set_mgm_key(
     :param store_on_device: If set, the management key is stored on device.
     """
     pivman = get_pivman_data(session)
+    pivman_old_bytes = pivman.get_bytes()
     pivman_prot = None
 
     if store_on_device or (not store_on_device and pivman.has_stored_key):
@@ -318,8 +335,10 @@ def pivman_set_mgm_key(
     # Set flag for stored or not stored key.
     pivman.mgm_key_protected = store_on_device
 
-    # Update readable pivman data
-    session.put_object(OBJECT_ID_PIVMAN_DATA, pivman.get_bytes())
+    # Update readable pivman data, if changed
+    pivman_bytes = pivman.get_bytes()
+    if pivman_old_bytes != pivman_bytes:
+        session.put_object(OBJECT_ID_PIVMAN_DATA, pivman_bytes)
 
     if pivman_prot is not None:
         if store_on_device:
@@ -354,7 +373,6 @@ def pivman_change_pin(session: PivSession, old_pin: str, new_pin: str) -> None:
     if pivman.has_derived_key:
         logger.debug("Has derived management key, update for new PIN")
         session.authenticate(
-            MANAGEMENT_KEY_TYPE.TDES,
             derive_management_key(old_pin, cast(bytes, pivman.salt)),
         )
         session.verify_pin(new_pin)
@@ -381,7 +399,7 @@ def pivman_set_pin_attempts(
         session.put_object(OBJECT_ID_PIVMAN_DATA, pivman.get_bytes())
 
 
-def list_certificates(session: PivSession) -> Mapping[SLOT, Optional[x509.Certificate]]:
+def list_certificates(session: PivSession) -> Mapping[SLOT, x509.Certificate | None]:
     """Read out and parse stored certificates.
 
     Only certificates which are successfully parsed are returned.
@@ -389,7 +407,8 @@ def list_certificates(session: PivSession) -> Mapping[SLOT, Optional[x509.Certif
     :param session: The PIV session.
     """
     certs = {}
-    for slot in set(SLOT) - {SLOT.ATTESTATION}:
+    slots: list[SLOT] = [s for s in SLOT if s != SLOT.ATTESTATION]
+    for slot in slots:
         try:
             certs[slot] = session.get_certificate(slot)
         except ApduError:
@@ -402,7 +421,8 @@ def list_certificates(session: PivSession) -> Mapping[SLOT, Optional[x509.Certif
 
 def _list_keys(session: PivSession) -> Mapping[SLOT, SlotMetadata]:
     keys = {}
-    for slot in set(SLOT) - {SLOT.ATTESTATION}:
+    slots: list[SLOT] = [s for s in SLOT if s != SLOT.ATTESTATION]
+    for slot in slots:
         try:
             keys[slot] = session.get_slot_metadata(slot)
         except ApduError as e:
@@ -414,7 +434,7 @@ def _list_keys(session: PivSession) -> Mapping[SLOT, SlotMetadata]:
 def check_key(
     session: PivSession,
     slot: SLOT,
-    public_key: Union[rsa.RSAPublicKey, ec.EllipticCurvePublicKey],
+    public_key: PublicKeyTypes,
 ) -> bool:
     """Check that a given public key corresponds to the private key in a slot.
 
@@ -449,7 +469,7 @@ def check_key(
         elif isinstance(public_key, ec.EllipticCurvePublicKey):
             public_key.verify(test_sig, test_data, ec.ECDSA(hashes.SHA256()))
         else:
-            raise ValueError("Unknown key type: " + type(public_key))
+            raise ValueError(f"Unknown key type: {type(public_key)}")
         return True
 
     except ApduError as e:
@@ -465,22 +485,17 @@ def check_key(
 
 def generate_chuid() -> bytes:
     """Generate a CHUID (Cardholder Unique Identifier)."""
-    # Non-Federal Issuer FASC-N
-    # [9999-9999-999999-0-1-0000000000300001]
-    FASC_N = (
-        b"\xd4\xe7\x39\xda\x73\x9c\xed\x39\xce\x73\x9d\x83\x68"
-        + b"\x58\x21\x08\x42\x10\x84\x21\xc8\x42\x10\xc3\xeb"
-    )
-    # Expires on: 2030-01-01
-    EXPIRY = b"\x32\x30\x33\x30\x30\x31\x30\x31"
 
-    return (
-        Tlv(0x30, FASC_N)
-        + Tlv(0x34, os.urandom(16))
-        + Tlv(0x35, EXPIRY)
-        + Tlv(0x3E)
-        + Tlv(TAG_LRC)
+    chuid = Chuid(
+        # Non-Federal Issuer FASC-N
+        fasc_n=FascN(9999, 9999, 999999, 0, 1, 0000000000, 3, 0000, 1),
+        guid=uuid4().bytes,
+        # Expires on: 2030-01-01
+        expiration_date=date(2030, 1, 1),
+        asymmetric_signature=b"",
     )
+
+    return bytes(chuid)
 
 
 def generate_ccc() -> bytes:
@@ -508,10 +523,10 @@ def get_piv_info(session: PivSession):
     :param session: The PIV session.
     """
     pivman = get_pivman_data(session)
-    info: Dict[str, Any] = {
+    info: dict[str, Any] = {
         "PIV version": session.version,
     }
-    lines: List[Any] = [info]
+    lines: list[Any] = [info]
 
     try:
         pin_data = session.get_pin_metadata()
@@ -523,31 +538,31 @@ def get_piv_info(session: PivSession):
         tries = session.get_pin_attempts()
         tries_str = "15 or more" if tries == 15 else str(tries)
     info["PIN tries remaining"] = tries_str
-    try:
-        puk_data = session.get_puk_metadata()
-        if puk_data.attempts_remaining == 0:
-            lines.append("PUK is blocked")
-        elif puk_data.default_value:
-            lines.append("WARNING: Using default PUK!")
-        tries_str = "%d/%d" % (
-            puk_data.attempts_remaining,
-            puk_data.total_attempts,
-        )
-        info["PUK tries remaining"] = tries_str
-    except NotSupportedError:
-        if pivman.puk_blocked:
-            lines.append("PUK is blocked")
 
-    try:
+    try:  # Bio metadata
         bio = session.get_bio_metadata()
         if bio.configured:
-            info[
-                "Biometrics"
-            ] = f"Configured, {bio.attempts_remaining} attempts remaining"
+            info["Biometrics"] = (
+                f"Configured, {bio.attempts_remaining} attempts remaining"
+            )
         else:
             info["Biometrics"] = "Not configured"
     except NotSupportedError:
-        pass
+        try:  # PUK metadata (on non-bio)
+            puk_data = session.get_puk_metadata()
+            if puk_data.attempts_remaining == 0:
+                lines.append("PUK is blocked")
+            elif puk_data.default_value:
+                lines.append("WARNING: Using default PUK!")
+            tries_str = "%d/%d" % (
+                puk_data.attempts_remaining,
+                puk_data.total_attempts,
+            )
+            info["PUK tries remaining"] = tries_str
+        except NotSupportedError:
+            # YK < 5.3
+            if pivman.puk_blocked:
+                lines.append("PUK is blocked")
 
     try:
         metadata = session.get_management_key_metadata()
@@ -563,7 +578,7 @@ def get_piv_info(session: PivSession):
     if pivman.has_stored_key:
         lines.append("Management key is stored on the YubiKey, protected by PIN.")
 
-    objects: Dict[str, Any] = {}
+    objects: dict[str, Any] = {}
     lines.append(objects)
     try:
         objects["CHUID"] = session.get_object(OBJECT_ID.CHUID)
@@ -586,11 +601,10 @@ def get_piv_info(session: PivSession):
         keys = _list_keys(session)
     except NotSupportedError:
         keys = {}
-    for slot in set(SLOT) - {SLOT.ATTESTATION}:
-        if slot not in keys and slot not in certs:
-            continue
 
-        cert_data: Dict[str, Any] = {}
+    slots = [s for s in SLOT if s in keys or s in certs]
+    for slot in slots:
+        cert_data: dict[str, Any] = {}
         objects[f"Slot {slot}"] = cert_data
         if slot in keys:
             cert_data["Private key type"] = keys[slot].key_type
@@ -599,18 +613,8 @@ def get_piv_info(session: PivSession):
         cert = certs.get(slot, None)
         if cert:
             try:
-                # Try to read out full DN, fallback to only CN.
-                # Support for DN was added in crytography 2.5
                 subject_dn = cert.subject.rfc4514_string()
                 issuer_dn = cert.issuer.rfc4514_string()
-                print_dn = True
-            except AttributeError:
-                print_dn = False
-                logger.debug("Failed to read DN, falling back to only CNs")
-                cn = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
-                subject_cn = cn[0].value if cn else "None"
-                cn = cert.issuer.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
-                issuer_cn = cn[0].value if cn else "None"
             except ValueError as e:
                 # Malformed certificates may throw ValueError
                 logger.debug("Failed parsing certificate", exc_info=True)
@@ -625,7 +629,7 @@ def get_piv_info(session: PivSession):
             serial = cert.serial_number
             try:
                 try:  # Prefer timezone-aware variant (cryptography >= 42)
-                    not_before: Optional[datetime] = cert.not_valid_before_utc
+                    not_before: datetime | None = cert.not_valid_before_utc
                 except AttributeError:
                     not_before = cert.not_valid_before
             except ValueError:
@@ -633,7 +637,7 @@ def get_piv_info(session: PivSession):
                 not_before = None
             try:
                 try:  # Prefer timezone-aware variant (cryptography >= 42)
-                    not_after: Optional[datetime] = cert.not_valid_after_utc
+                    not_after: datetime | None = cert.not_valid_after_utc
                 except AttributeError:
                     not_after = cert.not_valid_after
             except ValueError:
@@ -642,13 +646,9 @@ def get_piv_info(session: PivSession):
 
             # Print out everything
             cert_data["Public key type"] = key_algo
-            if print_dn:
-                cert_data["Subject DN"] = subject_dn
-                cert_data["Issuer DN"] = issuer_dn
-            else:
-                cert_data["Subject CN"] = subject_cn
-                cert_data["Issuer CN"] = issuer_cn
-            cert_data["Serial"] = serial
+            cert_data["Subject DN"] = subject_dn
+            cert_data["Issuer DN"] = issuer_dn
+            cert_data["Serial"] = display_serial(serial)
             cert_data["Fingerprint"] = fingerprint
             if not_before:
                 cert_data["Not before"] = not_before.isoformat()
@@ -660,16 +660,16 @@ def get_piv_info(session: PivSession):
     return lines
 
 
-_AllowedHashTypes = Union[
-    hashes.SHA224,
-    hashes.SHA256,
-    hashes.SHA384,
-    hashes.SHA512,
-    hashes.SHA3_224,
-    hashes.SHA3_256,
-    hashes.SHA3_384,
-    hashes.SHA3_512,
-]
+_AllowedHashTypes: TypeAlias = (
+    hashes.SHA224
+    | hashes.SHA256
+    | hashes.SHA384
+    | hashes.SHA512
+    | hashes.SHA3_224
+    | hashes.SHA3_256
+    | hashes.SHA3_384
+    | hashes.SHA3_512
+)
 
 
 def _hash(key_type, hash_algorithm):
@@ -683,7 +683,7 @@ def sign_certificate_builder(
     slot: SLOT,
     key_type: KEY_TYPE,
     builder: x509.CertificateBuilder,
-    hash_algorithm: Type[_AllowedHashTypes] = hashes.SHA256,
+    hash_algorithm: type[_AllowedHashTypes] = hashes.SHA256,
 ) -> x509.Certificate:
     """Sign a Certificate.
 
@@ -695,6 +695,7 @@ def sign_certificate_builder(
     """
     logger.debug("Signing a certificate")
     dummy_key = _dummy_key(key_type)
+    assert not isinstance(dummy_key, x25519.X25519PrivateKey)  # noqa: S101
     cert = builder.sign(dummy_key, _hash(key_type, hash_algorithm), default_backend())
 
     sig = session.sign(
@@ -717,9 +718,9 @@ def sign_certificate_builder(
 def sign_csr_builder(
     session: PivSession,
     slot: SLOT,
-    public_key: Union[rsa.RSAPublicKey, ec.EllipticCurvePublicKey],
+    public_key: PublicKeyTypes,
     builder: x509.CertificateSigningRequestBuilder,
-    hash_algorithm: Type[_AllowedHashTypes] = hashes.SHA256,
+    hash_algorithm: type[_AllowedHashTypes] = hashes.SHA256,
 ) -> x509.CertificateSigningRequest:
     """Sign a CSR.
 
@@ -733,6 +734,7 @@ def sign_csr_builder(
     logger.debug("Signing a CSR")
     key_type = KEY_TYPE.from_public_key(public_key)
     dummy_key = _dummy_key(key_type)
+    assert not isinstance(dummy_key, x25519.X25519PrivateKey)  # noqa: S101
 
     csr = builder.sign(dummy_key, _hash(key_type, hash_algorithm), default_backend())
     seq = Tlv.parse_list(Tlv.unpack(0x30, csr.public_bytes(Encoding.DER)))
@@ -766,11 +768,11 @@ def sign_csr_builder(
 def generate_self_signed_certificate(
     session: PivSession,
     slot: SLOT,
-    public_key: Union[rsa.RSAPublicKey, ec.EllipticCurvePublicKey],
+    public_key: PublicKeyTypes,
     subject_str: str,
     valid_from: datetime,
     valid_to: datetime,
-    hash_algorithm: Type[_AllowedHashTypes] = hashes.SHA256,
+    hash_algorithm: type[_AllowedHashTypes] = hashes.SHA256,
 ) -> x509.Certificate:
     """Generate a self-signed certificate using a private key in a slot.
 
@@ -784,6 +786,8 @@ def generate_self_signed_certificate(
     """
     logger.debug("Generating a self-signed certificate")
     key_type = KEY_TYPE.from_public_key(public_key)
+    if TYPE_CHECKING:
+        public_key = cast(CertificatePublicKeyTypes, public_key)
 
     subject = parse_rfc4514_string(subject_str)
     builder = (
@@ -802,9 +806,9 @@ def generate_self_signed_certificate(
 def generate_csr(
     session: PivSession,
     slot: SLOT,
-    public_key: Union[rsa.RSAPublicKey, ec.EllipticCurvePublicKey],
+    public_key: PublicKeyTypes,
     subject_str: str,
-    hash_algorithm: Type[_AllowedHashTypes] = hashes.SHA256,
+    hash_algorithm: type[_AllowedHashTypes] = hashes.SHA256,
 ) -> x509.CertificateSigningRequest:
     """Generate a CSR using a private key in a slot.
 

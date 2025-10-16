@@ -25,62 +25,65 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from yubikit.core import NotSupportedError
-from yubikit.core.smartcard import SmartCardConnection
+import datetime
+import logging
+from uuid import uuid4
+
+import click
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes, serialization
+
+from yubikit.core import TRANSPORT, NotSupportedError
+from yubikit.core.smartcard import SW, ApduError, SmartCardConnection
 from yubikit.management import CAPABILITY
 from yubikit.piv import (
-    PivSession,
-    InvalidPinError,
+    DEFAULT_MANAGEMENT_KEY,
     KEY_TYPE,
     MANAGEMENT_KEY_TYPE,
     OBJECT_ID,
-    SLOT,
     PIN_POLICY,
+    SLOT,
     TOUCH_POLICY,
-    DEFAULT_MANAGEMENT_KEY,
+    Chuid,
+    InvalidPinError,
+    PivSession,
 )
-from yubikit.core.smartcard import ApduError, SW
 
-from ..util import (
-    get_leaf_certificates,
-    parse_private_key,
-    parse_certificates,
-    InvalidPasswordError,
-)
 from ..piv import (
+    check_key,
+    derive_management_key,
+    generate_ccc,
+    generate_chuid,
+    generate_csr,
+    generate_random_management_key,
+    generate_self_signed_certificate,
     get_piv_info,
     get_pivman_data,
     get_pivman_protected_data,
-    pivman_set_mgm_key,
     pivman_change_pin,
+    pivman_set_mgm_key,
     pivman_set_pin_attempts,
-    derive_management_key,
-    generate_random_management_key,
-    generate_chuid,
-    generate_ccc,
-    check_key,
-    generate_self_signed_certificate,
-    generate_csr,
+)
+from ..util import (
+    InvalidPasswordError,
+    get_leaf_certificates,
+    parse_certificates,
+    parse_private_key,
 )
 from .util import (
     CliFail,
-    click_group,
+    EnumChoice,
+    click_callback,
     click_force_option,
     click_format_option,
+    click_group,
     click_postpone_execution,
-    click_callback,
     click_prompt,
-    prompt_timeout,
-    EnumChoice,
+    get_scp_params,
+    log_or_echo,
     pretty_print,
+    prompt_timeout,
 )
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.backends import default_backend
-
-import click
-import datetime
-import logging
-
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +166,13 @@ click_hash_option = click.option(
     help="hash algorithm",
     callback=click_parse_hash,
 )
+click_update_chuid_option = click.option(
+    "--update-chuid/--no-update-chuid",
+    is_flag=True,
+    default=True,
+    show_default=True,
+    help="update the CHUID GUID to a new random value",
+)
 
 
 def _fname(fobj):
@@ -196,9 +206,25 @@ def piv(ctx):
     dev = ctx.obj["device"]
     conn = dev.open_connection(SmartCardConnection)
     ctx.call_on_close(conn.close)
-    session = PivSession(conn)
+
+    scp_params = get_scp_params(ctx, CAPABILITY.PIV, conn)
+    try:
+        session = PivSession(conn, scp_params)
+    except ApduError as e:
+        if (
+            e.sw == SW.CONDITIONS_NOT_SATISFIED
+            and not scp_params
+            and dev.transport == TRANSPORT.NFC
+        ):
+            raise CliFail("Unable to manage PIV over NFC without SCP")
+        raise
+
+    info = ctx.obj["info"]
     ctx.obj["session"] = session
     ctx.obj["pivman_data"] = get_pivman_data(session)
+    ctx.obj["fips_unready"] = (
+        CAPABILITY.PIV in info.fips_capable and CAPABILITY.PIV not in info.fips_approved
+    )
 
 
 @piv.command()
@@ -207,8 +233,12 @@ def info(ctx):
     """
     Display general status of the PIV application.
     """
-    info = get_piv_info(ctx.obj["session"])
-    click.echo("\n".join(pretty_print(info)))
+    info = ctx.obj["info"]
+    data = get_piv_info(ctx.obj["session"])
+    if CAPABILITY.PIV in info.fips_capable:
+        # This is a bit ugly as it makes assumptions about the structure of data
+        data[0]["FIPS approved"] = CAPABILITY.PIV in info.fips_approved
+    click.echo("\n".join(pretty_print(data)))
 
 
 @piv.command()
@@ -224,24 +254,35 @@ def reset(ctx, force):
     info = ctx.obj["info"]
     if CAPABILITY.PIV in info.reset_blocked:
         raise CliFail(
-            "Cannot perform PIV reset when biometrics are configured, "
+            "Cannot perform PIV reset when FIDO is configured, "
             "use 'ykman config reset' for full factory reset."
         )
 
-    force or click.confirm(
-        "WARNING! This will delete all stored PIV data and restore factory "
-        "settings. Proceed?",
-        abort=True,
-        err=True,
-    )
+    if not force:
+        click.confirm(
+            "WARNING! This will delete all stored PIV data and restore factory "
+            "settings. Proceed?",
+            abort=True,
+            err=True,
+        )
 
     click.echo("Resetting PIV data...")
-    ctx.obj["session"].reset()
+    session = ctx.obj["session"]
+    session.reset()
 
-    click.echo("Success! All PIV data have been cleared from the YubiKey.")
-    click.echo("Your YubiKey now has the default PIN, PUK and Management Key:")
-    click.echo("\tPIN:\t123456")
-    click.echo("\tPUK:\t12345678")
+    try:
+        has_puk = session.get_puk_metadata().attempts_remaining > 0
+    except NotSupportedError:
+        has_puk = True
+
+    click.echo("Reset complete. All PIV data has been cleared from the YubiKey.")
+    if has_puk:
+        click.echo("Your YubiKey now has the default PIN, PUK and Management Key:")
+        click.echo("\tPIN:\t123456")
+        click.echo("\tPUK:\t12345678")
+    else:
+        click.echo("Your YubiKey now has the default PIN and Management Key:")
+        click.echo("\tPIN:\t123456")
     click.echo("\tManagement Key:\t010203040506070801020304050607080102030405060708")
 
 
@@ -264,34 +305,58 @@ def set_pin_retries(ctx, management_key, pin, pin_retries, puk_retries, force):
     NOTE: This will reset the PIN and PUK to their factory defaults.
     """
     session = ctx.obj["session"]
+    info = ctx.obj["info"]
+    if CAPABILITY.PIV in info.fips_capable:
+        if not (
+            session.get_pin_metadata().default_value
+            and session.get_puk_metadata().default_value
+        ):
+            raise CliFail(
+                "Retry attempts must be set before PIN/PUK have been changed."
+            )
+
+    try:  # Can't change retries on Bio MPE
+        session.get_bio_metadata()
+        raise CliFail("PIN/PUK retries cannot be changed on this YubiKey.")
+    except NotSupportedError:
+        pass
+
     _ensure_authenticated(
         ctx, pin, management_key, require_pin_and_key=True, no_prompt=force
     )
     click.echo("WARNING: This will reset the PIN and PUK to the factory defaults!")
-    force or click.confirm(
-        f"Set the number of PIN and PUK retry attempts to: {pin_retries} "
-        f"{puk_retries}?",
-        abort=True,
-        err=True,
-    )
+    if not force:
+        click.confirm(
+            f"Set the number of PIN and PUK retry attempts to: {pin_retries} "
+            f"{puk_retries}?",
+            abort=True,
+            err=True,
+        )
     try:
         pivman_set_pin_attempts(session, pin_retries, puk_retries)
-        click.echo("Default PINs are set:")
+        click.echo("Number of PIN/PUK retries set.")
+        click.echo("Default PINs have been restored:")
         click.echo("\tPIN:\t123456")
         click.echo("\tPUK:\t12345678")
     except Exception:
-        raise CliFail("Setting pin retries failed.")
+        raise CliFail("Setting PIN retries failed.")
 
 
-def _do_change_pin_puk(pin_complexity, name, current, new, fn):
-    def validate_pin_length(pin, prefix):
-        unit = "characters" if pin_complexity else "bytes"
-        pin_len = len(pin) if pin_complexity else len(pin.encode())
-        if not 6 <= pin_len <= 8:
-            raise CliFail(f"{prefix} {name} must be between 6 and 8 {unit} long.")
+def _validate_pin_length(pin, name, pin_complexity, min_len):
+    unit = "characters" if pin_complexity else "bytes"
+    pin_len = len(pin) if pin_complexity else len(pin.encode())
+    if not min_len <= pin_len <= 8:
+        if min_len == 8:
+            raise CliFail(f"{name} must be exactly 8 {unit} long.")
+        else:
+            raise CliFail(f"{name} must be between {min_len} and 8 {unit} long.")
 
-    validate_pin_length(current, "Current")
-    validate_pin_length(new, "New")
+
+def _do_change_pin_puk(info, name, current, new, fn):
+    pin_complexity = info.pin_complexity
+    min_len = 8 if CAPABILITY.PIV in info.fips_capable else 6
+    _validate_pin_length(current, f"Current {name}", pin_complexity, 6)
+    _validate_pin_length(new, f"New {name}", pin_complexity, min_len)
 
     try:
         fn()
@@ -323,6 +388,9 @@ def change_pin(ctx, pin, new_pin):
     info = ctx.obj["info"]
     session = ctx.obj["session"]
 
+    if not session.get_pin_attempts():
+        raise CliFail("PIN is blocked.")
+
     if not pin:
         pin = _prompt_pin("Enter the current PIN")
     if not new_pin:
@@ -335,7 +403,7 @@ def change_pin(ctx, pin, new_pin):
         )
 
     _do_change_pin_puk(
-        info.pin_complexity,
+        info,
         "PIN",
         pin,
         new_pin,
@@ -358,6 +426,12 @@ def change_puk(ctx, puk, new_puk):
     info = ctx.obj["info"]
     session = ctx.obj["session"]
 
+    try:
+        if not session.get_puk_metadata().attempts_remaining:
+            raise CliFail("PUK is blocked.")
+    except NotSupportedError:
+        pass
+
     if not puk:
         puk = _prompt_pin("Enter the current PUK")
     if not new_puk:
@@ -370,7 +444,7 @@ def change_puk(ctx, puk, new_puk):
         )
 
     _do_change_pin_puk(
-        info.pin_complexity,
+        info,
         "PUK",
         puk,
         new_puk,
@@ -404,8 +478,6 @@ def change_puk(ctx, puk, new_puk):
     "--algorithm",
     help="management key algorithm",
     type=EnumChoice(MANAGEMENT_KEY_TYPE),
-    default=MANAGEMENT_KEY_TYPE.TDES.name,
-    show_default=True,
 )
 @click.option(
     "-p",
@@ -442,7 +514,21 @@ def change_management_key(
     A random key may be generated and stored on the YubiKey, protected by PIN.
     """
     session = ctx.obj["session"]
-    pivman = ctx.obj["pivman_data"]
+
+    if ctx.obj["fips_unready"] and protect:
+        raise CliFail(
+            "YubiKey FIPS must be in FIPS approved mode prior to using --protect."
+        )
+
+    if not algorithm:
+        try:
+            algorithm = session.get_management_key_metadata().key_type
+        except NotSupportedError:
+            algorithm = MANAGEMENT_KEY_TYPE.TDES
+
+    info = ctx.obj["info"]
+    if CAPABILITY.PIV in info.fips_capable and algorithm in (MANAGEMENT_KEY_TYPE.TDES,):
+        raise CliFail(f"{algorithm.name} not supported on YubiKey FIPS.")
 
     pin_verified = _ensure_authenticated(
         ctx,
@@ -455,13 +541,16 @@ def change_management_key(
 
     # Can't combine new key with generate.
     if new_management_key and generate:
-        ctx.fail("Invalid options: --new-management-key conflicts with --generate")
+        raise CliFail(
+            "Invalid options: --new-management-key conflicts with --generate."
+        )
 
     # Touch not supported on NEO.
     if touch and session.version < (4, 0, 0):
         raise CliFail("Require touch not supported on this YubiKey.")
 
     # If an old stored key needs to be cleared, the PIN is needed.
+    pivman = ctx.obj["pivman_data"]
     if not pin_verified and pivman.has_stored_key:
         if pin:
             _verify_pin(ctx, session, pivman, pin, no_prompt=force)
@@ -479,7 +568,7 @@ def change_management_key(
             if not protect:
                 click.echo(f"Generated management key: {new_management_key.hex()}")
         elif force:
-            ctx.fail(
+            raise CliFail(
                 "New management key not given. Remove the --force "
                 "flag, or set the --generate flag or the "
                 "--new-management-key option."
@@ -494,11 +583,11 @@ def change_management_key(
                     )
                 )
             except Exception:
-                ctx.fail("New management key has the wrong format.")
+                raise CliFail("New management key has the wrong format.")
 
     if len(new_management_key) != algorithm.key_len:
         raise CliFail(
-            "Management key has the wrong length (expected %d bytes)"
+            "Management key has the wrong length (expected %d bytes)."
             % algorithm.key_len
         )
 
@@ -506,6 +595,7 @@ def change_management_key(
         pivman_set_mgm_key(
             session, new_management_key, algorithm, touch=touch, store_on_device=protect
         )
+        click.echo("New management key set.")
     except ApduError:
         raise CliFail("Changing the management key failed.")
 
@@ -529,9 +619,18 @@ def unblock_pin(ctx, puk, new_pin):
             hide_input=True,
             confirmation_prompt=True,
         )
+
+    info = ctx.obj["info"]
+    _validate_pin_length(
+        new_pin,
+        "New PIN",
+        info.pin_complexity,
+        8 if CAPABILITY.PIV in info.fips_capable else 6,
+    )
+
     try:
         session.unblock_pin(puk, new_pin)
-        click.echo("PIN unblocked")
+        click.echo("New PIN set.")
     except InvalidPinError as e:
         attempts = e.attempts_remaining
         if attempts:
@@ -589,6 +688,12 @@ def generate_key(
     PUBLIC-KEY  file containing the generated public key (use '-' to use stdout)
     """
 
+    if ctx.obj["fips_unready"]:
+        raise CliFail(
+            "YubiKey FIPS must be in FIPS approved mode prior to key generation."
+        )
+    _check_key_support_fips(ctx, algorithm, pin_policy)
+
     session = ctx.obj["session"]
     _ensure_authenticated(ctx, pin, management_key)
 
@@ -601,9 +706,11 @@ def generate_key(
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
     )
-    logger.info(
+    log_or_echo(
         f"Private key generated in slot {slot}, public key written to "
-        f"{_fname(public_key_output)}"
+        f"{_fname(public_key_output)}",
+        logger,
+        public_key_output,
     )
 
 
@@ -628,6 +735,10 @@ def import_key(
     SLOT         PIV slot of the private key
     PRIVATE-KEY  file containing the private key (use '-' to use stdin)
     """
+
+    if ctx.obj["fips_unready"]:
+        raise CliFail("YubiKey FIPS must be in FIPS approved mode prior to key import.")
+
     session = ctx.obj["session"]
 
     data = private_key.read()
@@ -653,8 +764,13 @@ def import_key(
             continue
         break
 
+    _check_key_support_fips(
+        ctx, KEY_TYPE.from_public_key(private_key.public_key()), pin_policy
+    )
+
     _ensure_authenticated(ctx, pin, management_key)
     session.put_key(slot, private_key, pin_policy, touch_policy)
+    click.echo(f"Private key imported into slot {slot.name}.")
 
 
 @keys.command()
@@ -679,8 +795,10 @@ def attest(ctx, slot, certificate, format):
     except ApduError:
         raise CliFail("Attestation failed.")
     certificate.write(cert.public_bytes(encoding=format))
-    logger.info(
-        f"Attestation certificate for slot {slot} written to {_fname(certificate)}"
+    log_or_echo(
+        f"Attestation certificate for slot {slot} written to {_fname(certificate)}",
+        logger,
+        certificate,
     )
 
 
@@ -782,7 +900,11 @@ def export(ctx, slot, public_key_output, format, verify, pin):
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
     )
-    logger.info(f"Public key for slot {slot} written to {_fname(public_key_output)}")
+    log_or_echo(
+        f"Public key for slot {slot} written to {_fname(public_key_output)}",
+        logger,
+        public_key_output,
+    )
 
 
 # Disable unsupported command
@@ -803,16 +925,17 @@ def move_key(ctx, management_key, pin, source, dest):
     DEST              PIV slot to move the key into
     """
     if source == dest:
-        raise CliFail("SOURCE must be different from DEST")
+        raise CliFail("SOURCE must be different from DEST.")
     session = ctx.obj["session"]
     _ensure_authenticated(ctx, pin, management_key)
     try:
         session.move_key(source, dest)
+        click.echo(f"Key moved from slot {source.name} to slot {dest.name}.")
     except ApduError as e:
         if e.sw == SW.INCORRECT_PARAMETERS:
-            raise CliFail("DEST slot is not empty")
+            raise CliFail("DEST slot is not empty.")
         if e.sw == SW.REFERENCE_DATA_NOT_FOUND:
-            raise CliFail("No key in SOURCE slot")
+            raise CliFail("No key in SOURCE slot.")
         raise
 
 
@@ -834,6 +957,7 @@ def delete_key(ctx, management_key, pin, slot):
     _ensure_authenticated(ctx, pin, management_key)
     try:
         session.delete_key(slot)
+        click.echo(f"Key in slot {slot.name} deleted.")
     except ApduError as e:
         if e.sw == SW.REFERENCE_DATA_NOT_FOUND:
             raise CliFail(f"No key stored in slot {slot}.")
@@ -844,7 +968,35 @@ def delete_key(ctx, management_key, pin, slot):
 def cert():
     """
     Manage certificates.
+
+    By default, modifying the certificate in a slot will also update the
+    CHUID with a new random GUID. To prevent this, use the --no-update-chuid
+    option.
     """
+
+
+def _update_chuid(session):
+    try:
+        chuid_data = session.get_object(OBJECT_ID.CHUID)
+        try:
+            chuid = Chuid.from_bytes(chuid_data)
+        except ValueError:
+            logger.debug("Leaving unparsable CHUID as-is")
+            return
+        if chuid.asymmetric_signature:
+            # Signed CHUID, leave it alone
+            logger.debug("Leaving signed CHUID as-is")
+            return
+        chuid.guid = uuid4().bytes
+        chuid_data = bytes(chuid)
+        logger.debug("Updating CHUID GUID")
+    except ApduError as e:
+        if e.sw == SW.FILE_NOT_FOUND:
+            logger.debug("Generating new CHUID")
+            chuid_data = generate_chuid()
+        else:
+            raise
+    session.put_object(OBJECT_ID.CHUID, chuid_data)
 
 
 @cert.command("import")
@@ -861,10 +1013,11 @@ def cert():
 @click.option(
     "-c", "--compress", is_flag=True, help="compresses the certificate before storing"
 )
+@click_update_chuid_option
 @click_slot_argument
 @click.argument("cert", type=click.File("rb"), metavar="CERTIFICATE")
 def import_certificate(
-    ctx, management_key, pin, slot, cert, password, verify, compress
+    ctx, management_key, pin, slot, cert, password, verify, compress, update_chuid
 ):
     """
     Import an X.509 certificate.
@@ -922,10 +1075,10 @@ def import_certificate(
             if metadata.touch_policy in (TOUCH_POLICY.ALWAYS, TOUCH_POLICY.CACHED):
                 timeout = 0.0
             else:
-                timeout = None
+                timeout = 30.0  # Don't prompt
         except ApduError as e:
             if e.sw == SW.REFERENCE_DATA_NOT_FOUND:
-                raise CliFail(f"No private key in slot {slot}")
+                raise CliFail(f"No private key in slot {slot}.")
             raise
         except NotSupportedError:
             timeout = 1.0
@@ -935,13 +1088,15 @@ def import_certificate(
                 if not check_key(session, slot, public_key):
                     raise CliFail(
                         "The public key of the certificate does not match the "
-                        f"private key in slot {slot}"
+                        f"private key in slot {slot}."
                     )
 
         _verify_pin_if_needed(ctx, session, do_verify, pin)
 
     session.put_certificate(slot, cert_to_import, compress)
-    session.put_object(OBJECT_ID.CHUID, generate_chuid())
+    if update_chuid:
+        _update_chuid(session)
+    click.echo(f"Certificate imported into slot {slot.name}")
 
 
 @cert.command("export")
@@ -963,7 +1118,11 @@ def export_certificate(ctx, format, slot, certificate):
     try:
         cert = session.get_certificate(slot)
         certificate.write(cert.public_bytes(encoding=format))
-        logger.info(f"Certificate from slot {slot} exported to {_fname(certificate)}")
+        log_or_echo(
+            f"Certificate from slot {slot} exported to {_fname(certificate)}",
+            logger,
+            certificate,
+        )
     except ApduError as e:
         if e.sw == SW.FILE_NOT_FOUND:
             raise CliFail("No certificate found.")
@@ -976,7 +1135,9 @@ def export_certificate(ctx, format, slot, certificate):
 @click_management_key_option
 @click_pin_option
 @click_slot_argument
-@click.argument("public-key", type=click.File("rb"), metavar="PUBLIC-KEY")
+@click.argument(
+    "public-key", type=click.File("rb"), metavar="PUBLIC-KEY", required=False
+)
 @click.option(
     "-s",
     "--subject",
@@ -992,8 +1153,17 @@ def export_certificate(ctx, format, slot, certificate):
     show_default=True,
 )
 @click_hash_option
+@click_update_chuid_option
 def generate_certificate(
-    ctx, management_key, pin, slot, public_key, subject, valid_days, hash_algorithm
+    ctx,
+    management_key,
+    pin,
+    slot,
+    public_key,
+    subject,
+    valid_days,
+    hash_algorithm,
+    update_chuid,
 ):
     """
     Generate a self-signed X.509 certificate.
@@ -1012,7 +1182,7 @@ def generate_certificate(
         if metadata.touch_policy in (TOUCH_POLICY.ALWAYS, TOUCH_POLICY.CACHED):
             timeout = 0.0
         else:
-            timeout = None
+            timeout = 30.0  # Don't prompt
     except ApduError as e:
         if e.sw == SW.REFERENCE_DATA_NOT_FOUND:
             raise CliFail(f"No private key in slot {slot}.")
@@ -1020,8 +1190,13 @@ def generate_certificate(
     except NotSupportedError:
         timeout = 1.0
 
-    data = public_key.read()
-    public_key = serialization.load_pem_public_key(data, default_backend())
+    if public_key:
+        data = public_key.read()
+        public_key = serialization.load_pem_public_key(data, default_backend())
+    elif session.version < (5, 4, 0):
+        raise CliFail("PUBLIC-KEY required for YubiKey prior to 5.4.")
+    else:
+        public_key = session.get_slot_metadata(slot).public_key
 
     now = datetime.datetime.now(datetime.timezone.utc)
     valid_to = now + datetime.timedelta(days=valid_days)
@@ -1039,7 +1214,9 @@ def generate_certificate(
                 session, slot, public_key, subject, now, valid_to, hash_algorithm
             )
         session.put_certificate(slot, cert)
-        session.put_object(OBJECT_ID.CHUID, generate_chuid())
+        if update_chuid:
+            _update_chuid(session)
+        click.echo(f"Certificate generated in slot {slot.name}.")
     except ApduError:
         raise CliFail("Certificate generation failed.")
 
@@ -1085,7 +1262,7 @@ def generate_certificate_signing_request(
         if metadata.touch_policy in (TOUCH_POLICY.ALWAYS, TOUCH_POLICY.CACHED):
             timeout = 0.0
         else:
-            timeout = None
+            timeout = 30.0  # Don't prompt
     except ApduError as e:
         if e.sw == SW.REFERENCE_DATA_NOT_FOUND:
             raise CliFail(f"No private key in slot {slot}.")
@@ -1103,7 +1280,9 @@ def generate_certificate_signing_request(
         raise CliFail("Certificate Signing Request generation failed.")
 
     csr_output.write(csr.public_bytes(encoding=serialization.Encoding.PEM))
-    logger.info(f"CSR for slot {slot} written to {_fname(csr_output)}")
+    log_or_echo(
+        f"CSR for slot {slot} written to {_fname(csr_output)}", logger, csr_output
+    )
 
 
 @cert.command("delete")
@@ -1111,7 +1290,8 @@ def generate_certificate_signing_request(
 @click_management_key_option
 @click_pin_option
 @click_slot_argument
-def delete_certificate(ctx, management_key, pin, slot):
+@click_update_chuid_option
+def delete_certificate(ctx, management_key, pin, slot, update_chuid):
     """
     Delete a certificate.
 
@@ -1123,7 +1303,9 @@ def delete_certificate(ctx, management_key, pin, slot):
     session = ctx.obj["session"]
     _ensure_authenticated(ctx, pin, management_key)
     session.delete_certificate(slot)
-    session.put_object(OBJECT_ID.CHUID, generate_chuid())
+    if update_chuid:
+        _update_chuid(session)
+    click.echo(f"Certificate in slot {slot.name} deleted.")
 
 
 @piv.group("objects")
@@ -1163,11 +1345,22 @@ def read_object(ctx, pin, object_id, output):
 
     session = ctx.obj["session"]
     pivman = ctx.obj["pivman_data"]
+    if ctx.obj["fips_unready"] and object_id in (
+        OBJECT_ID.PRINTED,
+        OBJECT_ID.FINGERPRINTS,
+        OBJECT_ID.FACIAL,
+        OBJECT_ID.IRIS,
+    ):
+        raise CliFail(
+            "YubiKey FIPS must be in FIPS approved mode to export this object."
+        )
 
     def do_read_object(retry=True):
         try:
             output.write(session.get_object(object_id))
-            logger.info(f"Exported object {object_id} to {_fname(output)}")
+            log_or_echo(
+                f"Exported object {object_id} to {_fname(output)}", logger, output
+            )
         except ApduError as e:
             if e.sw == SW.FILE_NOT_FOUND:
                 raise CliFail("No data found.")
@@ -1200,10 +1393,19 @@ def write_object(ctx, pin, management_key, object_id, data):
     """
 
     session = ctx.obj["session"]
+
+    if OBJECT_ID.PRINTED == object_id:
+        pivman = ctx.obj["pivman_data"]
+        if pivman.has_protected_key:
+            raise CliFail(
+                "Can't write to slot 0x5fc109 while management key is protected by PIN."
+            )
+
     _ensure_authenticated(ctx, pin, management_key)
 
     try:
         session.put_object(object_id, data.read())
+        click.echo("Object imported.")
     except ApduError as e:
         if e.sw == SW.INCORRECT_PARAMETERS:
             raise CliFail("Something went wrong, is the object id valid?")
@@ -1235,7 +1437,8 @@ def generate_object(ctx, pin, management_key, object_id):
     elif OBJECT_ID.CAPABILITY == object_id:
         session.put_object(OBJECT_ID.CAPABILITY, generate_ccc())
     else:
-        ctx.fail("Unsupported object ID for generate.")
+        raise CliFail("Unsupported object ID for generate.")
+    click.echo("Object generated.")
 
 
 def _prompt_management_key(prompt="Enter a management key [blank to use default key]"):
@@ -1266,7 +1469,8 @@ def _ensure_authenticated(
     pivman = ctx.obj["pivman_data"]
 
     if pivman.has_protected_key and not management_key:
-        _verify_pin(ctx, session, pivman, pin, no_prompt=no_prompt)
+        if not _verify_pin(ctx, session, pivman, pin, no_prompt=no_prompt):
+            raise CliFail("Failed to authenticate with protected management key.")
         return True
 
     _authenticate(ctx, session, management_key, mgm_key_prompt, no_prompt=no_prompt)
@@ -1284,22 +1488,23 @@ def _verify_pin(ctx, session, pivman, pin, no_prompt=False):
         else:
             pin = _prompt_pin()
 
+    authenticated = False
+
     try:
         session.verify_pin(pin)
         if pivman.has_derived_key:
             with prompt_timeout():
-                session.authenticate(
-                    MANAGEMENT_KEY_TYPE.TDES, derive_management_key(pin, pivman.salt)
-                )
+                session.authenticate(derive_management_key(pin, pivman.salt))
+            authenticated = True
             session.verify_pin(pin)  # Ensure verify was the last thing we did
         elif pivman.has_stored_key:
-            pivman_prot = get_pivman_protected_data(session)
             try:
-                key_type = session.get_management_key_metadata().key_type
-            except NotSupportedError:
-                key_type = MANAGEMENT_KEY_TYPE.TDES
-            with prompt_timeout():
-                session.authenticate(key_type, pivman_prot.key)
+                pivman_prot = get_pivman_protected_data(session)
+                with prompt_timeout():
+                    session.authenticate(pivman_prot.key)
+                authenticated = True
+            except Exception:
+                logger.warning("Failed to read stored management key", exc_info=True)
             session.verify_pin(pin)  # Ensure verify was the last thing we did
     except InvalidPinError as e:
         attempts = e.attempts_remaining
@@ -1309,6 +1514,8 @@ def _verify_pin(ctx, session, pivman, pin, no_prompt=False):
             raise CliFail("PIN is blocked.")
     except Exception:
         raise CliFail("PIN verification failed.")
+
+    return authenticated
 
 
 def _verify_pin_if_needed(ctx, session, func, pin=None, no_prompt=False):
@@ -1327,19 +1534,25 @@ def _verify_pin_if_needed(ctx, session, func, pin=None, no_prompt=False):
 def _authenticate(ctx, session, management_key, mgm_key_prompt, no_prompt=False):
     if not management_key:
         if no_prompt:
-            ctx.fail("Management key required.")
+            raise CliFail("Management key required.")
         else:
             if mgm_key_prompt is None:
                 management_key = _prompt_management_key()
             else:
                 management_key = _prompt_management_key(mgm_key_prompt)
     try:
-        try:
-            key_type = session.get_management_key_metadata().key_type
-        except NotSupportedError:
-            key_type = MANAGEMENT_KEY_TYPE.TDES
-
         with prompt_timeout():
-            session.authenticate(key_type, management_key)
+            session.authenticate(management_key)
     except Exception:
         raise CliFail("Authentication with management key failed.")
+
+
+def _check_key_support_fips(ctx, key_type, pin_policy):
+    info = ctx.obj["info"]
+    if CAPABILITY.PIV in info.fips_capable:
+        if key_type in (KEY_TYPE.RSA1024, KEY_TYPE.X25519):
+            raise CliFail(f"Key type {key_type.name} not supported on YubiKey FIPS.")
+        if pin_policy in (PIN_POLICY.NEVER,):
+            raise CliFail(
+                f"PIN policy {pin_policy.name} not supported on YubiKey FIPS."
+            )

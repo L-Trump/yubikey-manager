@@ -25,41 +25,68 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from yubikit.core import ApplicationNotAvailableError
-from yubikit.core.otp import OtpConnection
-from yubikit.core.fido import FidoConnection
-from yubikit.core.smartcard import SmartCardConnection
-from yubikit.support import get_name, read_info
-from yubikit.logging import LOG_LEVEL
-
-from .. import __version__
-from ..pcsc import list_devices as list_ccid, list_readers
-from ..device import scan_devices, list_all_devices as _list_all_devices
-from ..util import get_windows_version
-from ..logging import init_logging
-from ..diagnostics import get_diagnostics, sys_info
-from ..settings import AppData
-from .util import YkmanContextObject, click_group, EnumChoice, CliFail, pretty_print
-from .info import info
-from .otp import otp
-from .openpgp import openpgp
-from .oath import oath
-from .piv import piv
-from .fido import fido
-from .config import config
-from .aliases import apply_aliases
-from .apdu import apdu
-from .script import run_script
-from .hsmauth import hsmauth
+import ctypes
+import logging
+import re
+import sys
+import time
+from dataclasses import replace
 
 import click
 import click.shell_completion
-import ctypes
-import time
-import sys
+from cryptography.exceptions import InvalidSignature
 
-import logging
+from yubikit.core import ApplicationNotAvailableError, _override_version
+from yubikit.core.fido import FidoConnection
+from yubikit.core.otp import OtpConnection
+from yubikit.core.smartcard import SmartCardConnection
+from yubikit.core.smartcard.scp import (
+    KeyRef,
+    Scp03KeyParams,
+    ScpKid,
+    StaticKeys,
+)
+from yubikit.logging import LOG_LEVEL
+from yubikit.management import RELEASE_TYPE
+from yubikit.support import get_name, read_info
 
+from .. import __version__
+from ..device import list_all_devices as _list_all_devices
+from ..device import scan_devices
+from ..diagnostics import get_diagnostics, sys_info
+from ..logging import init_logging
+from ..pcsc import list_devices as list_ccid
+from ..pcsc import list_readers
+from ..settings import AppData
+from ..util import (
+    InvalidPasswordError,
+    get_windows_version,
+    is_nfc_restricted,
+    parse_certificates,
+    parse_private_key,
+)
+from .apdu import apdu
+from .config import config
+from .fido import fido
+from .hsmauth import hsmauth
+from .info import info
+from .oath import oath
+from .openpgp import openpgp
+from .otp import otp
+from .piv import piv
+from .script import run_script
+from .securitydomain import ScpKidParamType, click_parse_scp_ref, securitydomain
+from .util import (
+    CliFail,
+    EnumChoice,
+    HexIntParamType,
+    YkmanContextObject,
+    click_group,
+    click_prompt,
+    find_scp11_params,
+    organize_scp11_certificates,
+    pretty_print,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,12 +129,22 @@ def require_reader(connection_types, reader):
         readers = list_ccid(reader)
         if len(readers) == 1:
             dev = readers[0]
+            nfc_restricted = False
             try:
                 with dev.open_connection(SmartCardConnection) as conn:
-                    info = read_info(conn, dev.pid)
-                return dev, info
+                    try:
+                        info = read_info(conn, dev.pid)
+                        return dev, info
+                    except ValueError:
+                        nfc_restricted = is_nfc_restricted(conn)
+                        raise  # Re-raise to be handled in block below
             except Exception:
-                raise CliFail("Failed to connect to YubiKey")
+                if nfc_restricted:
+                    raise CliFail(
+                        "YubiKey is in NFC restricted mode "
+                        "(see: https://www.yubico.com/getting-started/)."
+                    )
+                raise CliFail("Failed to connect to YubiKey.")
         elif len(readers) > 1:
             raise CliFail("Multiple external readers match name.")
         else:
@@ -154,7 +191,7 @@ def require_device(connection_types, serial=None):
         pid = next(iter(devices.keys()))
         supported = [c for c in connection_types if pid.supports_connection(c)]
         if WIN_CTAP_RESTRICTED and supported == [FidoConnection]:
-            # FIDO-only command on Windows without Admin won't work.
+            # FIDO-only command on Windows without Admin won't work
             raise CliFail("FIDO access on Windows requires running as Administrator.")
         if not supported:
             interfaces = [c.usb_interface for c in connection_types]
@@ -218,6 +255,50 @@ def require_device(connection_types, serial=None):
     ],
 )
 @click.option(
+    "-t",
+    "--scp-ca",
+    type=click.File("rb"),
+    help="specify the CA to use to verify the SCP11 card key (CA-KLCC)",
+)
+@click.option(
+    "-c",
+    "--scp-sd",
+    metavar="KID KVN",
+    type=(ScpKidParamType(), HexIntParamType()),
+    default=(0, 0),
+    callback=click_parse_scp_ref,
+    hidden="--full-help" not in sys.argv,
+    help="specify which key the YubiKey is using to authenticate",
+)
+@click.option(
+    "-o",
+    "--scp-oce",
+    metavar="KID KVN",
+    type=HexIntParamType(),
+    nargs=2,
+    default=(0, 0),
+    hidden="--full-help" not in sys.argv,
+    help="specify which key the OCE is using to authenticate",
+)
+@click.option(
+    "-s",
+    "--scp",
+    "scp_cred",
+    metavar="CRED",
+    multiple=True,
+    help="specify private key and certificate chain for secure messaging, "
+    "can be used multiple times to provide key and certificates in multiple "
+    "files (private key, certificates in leaf-last order), OR SCP03 keys in hex "
+    "separated by colon (:) K-ENC:K-MAC[:K-DEK]",
+)
+@click.option(
+    "-p",
+    "--scp-password",
+    "scp_cred_password",
+    metavar="PASSWORD",
+    help="specify a password required to access the --scp file, if needed",
+)
+@click.option(
     "-l",
     "--log-level",
     default=None,
@@ -255,7 +336,18 @@ def require_device(connection_types, serial=None):
     help="show --help output, including hidden commands",
 )
 @click.pass_context
-def cli(ctx, device, log_level, log_file, reader):
+def cli(
+    ctx,
+    device,
+    scp_ca,
+    scp_sd,
+    scp_oce,
+    scp_cred,
+    scp_cred_password,
+    log_level,
+    log_file,
+    reader,
+):
     """
     Configure your YubiKey via the command line.
 
@@ -272,13 +364,15 @@ def cli(ctx, device, log_level, log_file, reader):
     ctx.obj = YkmanContextObject()
 
     if log_level:
-        init_logging(log_level, log_file=log_file)
+        init_logging(log_level, log_file=log_file, replace=log_file is None)
         logger.info("\n".join(pretty_print({"System info": sys_info()})))
     elif log_file:
         ctx.fail("--log-file requires specifying --log-level.")
 
     if reader and device:
         ctx.fail("--reader and --device options can't be combined.")
+
+    use_scp = bool(any(scp_sd) or scp_cred or scp_ca)
 
     subcmd = next(c for c in COMMANDS if c.name == ctx.invoked_subcommand)
     # Commands that don't directly act on a key
@@ -287,7 +381,13 @@ def cli(ctx, device, log_level, log_file, reader):
             ctx.fail("--device can't be used with this command.")
         if reader:
             ctx.fail("--reader can't be used with this command.")
+        if use_scp:
+            ctx.fail("SCP can't be used with this command.")
         return
+
+    # FIDO command on Windows without Admin won't work
+    if subcmd == fido and WIN_CTAP_RESTRICTED:
+        raise CliFail("FIDO access on Windows requires running as Administrator.")
 
     # Commands which need a YubiKey to act on
     connections = getattr(
@@ -296,24 +396,148 @@ def cli(ctx, device, log_level, log_file, reader):
     if connections:
 
         def resolve():
-            if connections == [FidoConnection] and WIN_CTAP_RESTRICTED:
-                # FIDO-only command on Windows without Admin won't work.
-                raise CliFail(
-                    "FIDO access on Windows requires running as Administrator."
-                )
-
             items = getattr(resolve, "items", None)
             if not items:
+                # We might be connecting over NFC, and thus may require SCP11
                 if reader is not None:
                     items = require_reader(connections, reader)
                 else:
                     items = require_device(connections, device)
+
+                if items[1].version_qualifier.type != RELEASE_TYPE.FINAL:
+                    # Preview build, override version
+                    version_q = items[1].version_qualifier
+                    _override_version(version_q.version)
+                    logger.info(f"Debug key detected: {version_q}")
+
                 setattr(resolve, "items", items)
             return items
 
         ctx.obj.add_resolver("device", lambda: resolve()[0])
         ctx.obj.add_resolver("pid", lambda: resolve()[0].pid)
         ctx.obj.add_resolver("info", lambda: resolve()[1])
+
+        if use_scp:
+            if SmartCardConnection not in connections:
+                raise CliFail("SCP can only be used with CCID commands.")
+
+            scp_kid, scp_kvn = scp_sd
+            if scp_kid:
+                try:
+                    scp_kid = ScpKid(scp_kid)
+                except ValueError:
+                    raise CliFail(f"Invalid KID for card certificate: {scp_kid}.")
+
+            if scp_ca:
+                ca = scp_ca.read()
+            else:
+                ca = None
+
+            key_fmt = r"[0-9a-fA-F]{32}"
+            re_hex_keys = re.compile(rf"^{key_fmt}:{key_fmt}(:{key_fmt})?$")
+            if len(scp_cred) == 1 and re_hex_keys.match(scp_cred[0]):
+                scp03_keys = StaticKeys(
+                    *(bytes.fromhex(k) for k in scp_cred[0].split(":"))
+                )
+                scp11_creds = None
+            else:
+                f = click.File("rb")
+                scp11_creds = [f.convert(fn, None, ctx).read() for fn in scp_cred]
+                scp03_keys = None
+
+            if not scp_kid:
+                if scp03_keys:
+                    scp_kid = ScpKid.SCP03
+                elif not scp11_creds:
+                    scp_kid = ScpKid.SCP11b
+
+            if scp03_keys and scp_kid != ScpKid.SCP03:
+                raise CliFail("--scp with SCP03 keys can only be used with SCP03.")
+
+            if scp_kid == ScpKid.SCP03:
+                if scp_ca:
+                    raise CliFail("--scp-ca can only be used with SCP11.")
+
+                def params_f_scp03(_):
+                    return Scp03KeyParams(
+                        ref=KeyRef(ScpKid.SCP03, scp_kvn),
+                        keys=scp03_keys or StaticKeys.default(),
+                    )
+
+                params_f = params_f_scp03
+
+            elif scp11_creds:
+                # SCP11 a/c
+                if scp_kid and scp_kid not in (ScpKid.SCP11a, ScpKid.SCP11c):
+                    raise CliFail("--scp with file(s) can only be used with SCP11 a/c.")
+
+                first = scp11_creds.pop(0)
+                password = scp_cred_password.encode() if scp_cred_password else None
+
+                while True:
+                    try:
+                        sk_oce_ecka = parse_private_key(first, password)
+                        break
+                    except InvalidPasswordError:
+                        if scp_cred_password:
+                            raise CliFail("Wrong password to decrypt private key.")
+                        logger.debug("Error parsing key", exc_info=True)
+                        password = click_prompt(
+                            "Enter password to decrypt SCP11 key",
+                            default="",
+                            hide_input=True,
+                            show_default=False,
+                        ).encode()
+
+                if scp11_creds:
+                    certificates = []
+                    for c in scp11_creds:
+                        certificates.extend(parse_certificates(c, None))
+                else:
+                    certificates = parse_certificates(first, password)
+                    # If the bundle contains the CA we strip it out
+                    _, inter, leaf = organize_scp11_certificates(certificates)
+                    # Send the KA-KLOC and OCE certificates
+                    certificates = list(inter) + [leaf]
+
+                def params_f_scp11ab(conn):
+                    if not scp_kid:
+                        # TODO: Find key based on CA
+                        # Check for SCP11a key, then SCP11c
+                        try:
+                            params = find_scp11_params(conn, ScpKid.SCP11a, scp_kvn, ca)
+                        except (ValueError, InvalidSignature) as e:
+                            try:
+                                params = find_scp11_params(
+                                    conn, ScpKid.SCP11c, scp_kvn, ca
+                                )
+                            except (ValueError, InvalidSignature):
+                                raise e
+                    else:
+                        params = find_scp11_params(conn, scp_kid, scp_kvn, ca)
+                    return replace(
+                        params,
+                        oce_ref=KeyRef(*scp_oce),
+                        sk_oce_ecka=sk_oce_ecka,
+                        certificates=certificates,
+                    )
+
+                params_f = params_f_scp11ab
+            else:
+                # SCP11b
+                if scp_kid not in (ScpKid.SCP11b, None):
+                    raise CliFail(f"{scp_kid.name} requires --scp.")
+                if any(scp_oce):
+                    raise CliFail("SCP11b cannot be used with --scp-oce.")
+
+                def params_f_scp11b(conn):
+                    return find_scp11_params(conn, ScpKid.SCP11b, scp_kvn, ca)
+
+                params_f = params_f_scp11b
+
+            connections = [SmartCardConnection]
+
+            ctx.obj.add_resolver("scp", lambda: params_f)
 
 
 @cli.command("list")
@@ -364,8 +588,7 @@ def _describe_device(dev, dev_info, include_mode=True):
     if dev.pid is None:  # Devices from list_all_devices should always have PID.
         raise AssertionError("PID is None")
     name = get_name(dev_info, dev.pid.yubikey_type)
-    version = dev_info.version or "unknown"
-    description = f"{name} ({version})"
+    description = f"{name} ({dev_info.version_name})"
     if include_mode:
         mode = dev.pid.name.split("_", 1)[1].replace("_", "+")
         description += f" [{mode}]"
@@ -384,6 +607,7 @@ COMMANDS = (
     apdu,
     run_script,
     hsmauth,
+    securitydomain,
 )
 
 
@@ -410,7 +634,6 @@ def main():
     handler.setFormatter(formatter)
     logging.getLogger().addHandler(handler)
 
-    sys.argv = apply_aliases(sys.argv)
     try:
         # --full-help triggers --help, hidden commands will already have read it by now.
         sys.argv[sys.argv.index("--full-help")] = "--help"
@@ -418,7 +641,7 @@ def main():
         pass  # No --full-help
 
     try:
-        cli(obj={})
+        cli(obj={}, windows_expand_args=False)
     except Exception as e:
         status = 1
         if isinstance(e, CliFail):
@@ -435,6 +658,7 @@ def main():
             msg = "An unexpected error has occurred"
             formatter.show_trace = True
         logger.exception(msg)
+        logging.shutdown()
         sys.exit(status)
 
 

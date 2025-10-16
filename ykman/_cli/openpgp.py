@@ -25,23 +25,38 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from yubikit.core.smartcard import ApduError, SW, SmartCardConnection
-from yubikit.openpgp import OpenPgpSession, UIF, PIN_POLICY, KEY_REF as _KEY_REF
+import logging
+from enum import IntEnum
+
+import click
+
+from yubikit.core import TRANSPORT
+from yubikit.core.smartcard import SW, ApduError, SmartCardConnection
+from yubikit.management import CAPABILITY
+from yubikit.openpgp import (
+    KEY_REF as _KEY_REF,
+)
+from yubikit.openpgp import (
+    KEY_STATUS,
+    PIN_POLICY,
+    UIF,
+    OpenPgpSession,
+)
+
+from ..openpgp import get_key_info, get_openpgp_info, safe_reset
 from ..util import parse_certificates, parse_private_key
-from ..openpgp import get_openpgp_info
 from .util import (
     CliFail,
+    EnumChoice,
     click_force_option,
     click_format_option,
+    click_group,
     click_postpone_execution,
     click_prompt,
-    click_group,
-    EnumChoice,
+    get_scp_params,
+    log_or_echo,
     pretty_print,
 )
-from enum import IntEnum
-import logging
-import click
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +96,28 @@ def openpgp(ctx):
     dev = ctx.obj["device"]
     conn = dev.open_connection(SmartCardConnection)
     ctx.call_on_close(conn.close)
-    ctx.obj["session"] = OpenPgpSession(conn)
+
+    scp_params = get_scp_params(ctx, CAPABILITY.OPENPGP, conn)
+
+    try:
+        ctx.obj["session"] = OpenPgpSession(conn, scp_params)
+    except ApduError as e:
+        if (
+            e.sw == SW.CONDITIONS_NOT_SATISFIED
+            and not scp_params
+            and dev.transport == TRANSPORT.NFC
+        ):
+            raise CliFail("Unable to manage OpenPGP over NFC without SCP")
+        elif e.sw == SW.MEMORY_FAILURE:
+            if ctx.invoked_subcommand == "reset":
+                ctx.obj["conn"] = conn
+            else:
+                raise CliFail(
+                    "Memory corruption detected, OpenPGP needs to be reset using "
+                    "'ykman openpgp reset'"
+                )
+        else:
+            raise
 
 
 @openpgp.command()
@@ -90,8 +126,12 @@ def info(ctx):
     """
     Display general status of the OpenPGP application.
     """
-    session = ctx.obj["session"]
-    click.echo("\n".join(pretty_print(get_openpgp_info(session))))
+    info = ctx.obj["info"]
+    data = get_openpgp_info(ctx.obj["session"])
+    if CAPABILITY.OPENPGP in info.fips_capable:
+        # This is a bit ugly as it makes assumptions about the structure of data
+        data["FIPS approved"] = CAPABILITY.OPENPGP in info.fips_approved
+    click.echo("\n".join(pretty_print(data)))
 
 
 @openpgp.command()
@@ -103,18 +143,26 @@ def reset(ctx, force):
 
     This action will wipe all OpenPGP data, and set all PINs to their default
     values.
+
+    The attestation key and certificate will NOT be reset.
     """
-    force or click.confirm(
-        "WARNING! This will delete all stored OpenPGP keys and data and restore "
-        "factory settings. Proceed?",
-        abort=True,
-        err=True,
-    )
+    if not force:
+        click.confirm(
+            "WARNING! This will delete all stored OpenPGP keys and data and restore "
+            "factory settings. Proceed?",
+            abort=True,
+            err=True,
+        )
 
     click.echo("Resetting OpenPGP data, don't remove the YubiKey...")
-    ctx.obj["session"].reset()
+    if "session" in ctx.obj:
+        ctx.obj["session"].reset()
+    else:
+        safe_reset(ctx.obj["conn"])
     logger.info("OpenPGP application data reset")
-    click.echo("Success! All data has been cleared and default PINs are set.")
+    click.echo(
+        "Reset complete. OpenPGP data has been cleared and default PINs are set."
+    )
     echo_default_pins()
 
 
@@ -164,10 +212,10 @@ def set_pin_retries(
         session.set_pin_attempts(
             user_pin_retries, reset_code_retries, admin_pin_retries
         )
-        logger.info("Number of PIN/Reset Code/Admin PIN retries set")
+        click.echo("Number of PIN/Reset Code/Admin PIN retries set.")
 
         if resets_pins:
-            click.echo("Default PINs are set.")
+            click.echo("Default values have been restored:")
             echo_default_pins()
 
 
@@ -179,8 +227,8 @@ def change_pin(ctx, pin, new_pin):
     """
     Change the User PIN.
 
-    The PIN has a minimum length of 6, and supports any type of
-    alphanumeric characters.
+    The PIN has a minimum length of 6 (or 8, for YubiKey 5.7+ FIPS when not using KDF),
+    and supports any type of alphanumeric characters.
     """
 
     session = ctx.obj["session"]
@@ -197,6 +245,7 @@ def change_pin(ctx, pin, new_pin):
 
     try:
         session.change_pin(pin, new_pin)
+        click.echo("User PIN has been changed.")
     except ApduError as e:
         if e.sw == SW.CONDITIONS_NOT_SATISFIED:
             raise CliFail("PIN does not meet complexity requirement.")
@@ -230,6 +279,7 @@ def change_reset_code(ctx, admin_pin, reset_code):
     session.verify_admin(admin_pin)
     try:
         session.set_reset_code(reset_code)
+        click.echo("Reset Code has been changed.")
     except ApduError as e:
         if e.sw == SW.CONDITIONS_NOT_SATISFIED:
             raise CliFail("Reset Code does not meet complexity requirement.")
@@ -262,6 +312,7 @@ def change_admin(ctx, admin_pin, new_admin_pin):
 
     try:
         session.change_admin(admin_pin, new_admin_pin)
+        click.echo("Admin PIN has been changed.")
     except ApduError as e:
         if e.sw == SW.CONDITIONS_NOT_SATISFIED:
             raise CliFail("Admin PIN does not meet complexity requirement.")
@@ -312,6 +363,7 @@ def unblock_pin(ctx, admin_pin, reset_code, new_pin):
 
     try:
         session.reset_pin(new_pin, reset_code)
+        click.echo("User PIN has been changed.")
     except ApduError as e:
         if e.sw == SW.CONDITIONS_NOT_SATISFIED:
             raise CliFail("New PIN does not meet complexity requirement.")
@@ -341,13 +393,38 @@ def set_signature_policy(ctx, policy, admin_pin):
     try:
         session.verify_admin(admin_pin)
         session.set_signature_pin_policy(policy)
+        click.echo("Signature PIN policy has been set.")
     except Exception:
-        raise CliFail("Failed to set new Signature PIN policy")
+        raise CliFail("Failed to set new Signature PIN policy.")
 
 
 @openpgp.group("keys")
 def keys():
     """Manage private keys."""
+
+
+@keys.command("info")
+@click.pass_context
+@click.argument("key", metavar="KEY", type=EnumChoice(KEY_REF))
+def metadata(ctx, key):
+    """
+    Show metadata about a private key.
+
+    This will show what type of key is stored in a specific slot,
+    whether it was imported into the YubiKey, or generated on-chip,
+    and what the Touch policy is for using the key.
+
+    \b
+    KEY            key slot to set (sig, dec, aut or att)
+    """
+
+    session = ctx.obj["session"]
+    discretionary = session.get_application_related_data().discretionary
+    status = discretionary.key_information.get(key)
+    if status == KEY_STATUS.NONE:
+        raise CliFail(f"No key stored in slot {key.name}.")
+    info = get_key_info(discretionary, key, status)
+    click.echo("\n".join(pretty_print(info)))
 
 
 @keys.command("set-touch")
@@ -364,19 +441,22 @@ def set_touch(ctx, key, policy, admin_pin, force):
     private key on the YubiKey. The touch policy is set individually for each key slot.
     To see the current touch policy, run the "openpgp info" subcommand.
 
+    WARNING: Setting the touch policy of the attestation key to "fixed" cannot be undone
+    without replacing the attestation private key.
+
     Touch policies:
 
     \b
-    Off (default)   no touch required
-    On              touch required
-    Fixed           touch required, can't be disabled without deleting the private key
-    Cached          touch required, cached for 15s after use
-    Cached-Fixed    touch required, cached for 15s after use, can't be disabled
-                    without deleting the private key
+    Off (default)  no touch required
+    On             touch required
+    Fixed          touch required, can't be disabled without deleting the private key
+    Cached         touch required, cached for 15s after use
+    Cached-Fixed   touch required, cached for 15s after use, can't be disabled
+                   without deleting the private key
 
     \b
-    KEY     key slot to set (sig, dec, aut or att)
-    POLICY  touch policy to set (on, off, fixed, cached or cached-fixed)
+    KEY            key slot to set (sig, dec, aut or att)
+    POLICY         touch policy to set (on, off, fixed, cached or cached-fixed)
     """
     session = ctx.obj["session"]
     policy_name = policy.name.lower().replace("_", "-")
@@ -396,7 +476,7 @@ def set_touch(ctx, key, policy, admin_pin, force):
         try:
             session.verify_admin(admin_pin)
             session.set_uif(key, policy)
-            logger.info(f"Touch policy for slot {key.name} set")
+            click.echo(f"Touch policy for slot {key.name} set.")
         except ApduError as e:
             if e.sw == SW.SECURITY_CONDITION_NOT_SATISFIED:
                 raise CliFail("Touch policy not allowed.")
@@ -410,11 +490,15 @@ def set_touch(ctx, key, policy, admin_pin, force):
 @click.argument("private-key", type=click.File("rb"), metavar="PRIVATE-KEY")
 def import_key(ctx, key, private_key, admin_pin):
     """
-    Import a private key (ONLY SUPPORTS ATTESTATION KEY).
-
     Import a private key for OpenPGP attestation.
 
+    The attestation key is by default pre-generated during production with a
+    Yubico-issued key and certificate.
+
+    WARNING: This private key cannot be recovered once overwritten!
+
     \b
+    KEY          key slot to import to (only 'att' supported)
     PRIVATE-KEY  file containing the private key (use '-' to use stdin)
     """
     session = ctx.obj["session"]
@@ -431,7 +515,7 @@ def import_key(ctx, key, private_key, admin_pin):
     try:
         session.verify_admin(admin_pin)
         session.put_key(key, private_key)
-        logger.info(f"Private key imported for slot {key.name}")
+        click.echo(f"Private key imported for slot {key.name}.")
     except Exception:
         raise CliFail("Failed to import attestation key.")
 
@@ -475,12 +559,14 @@ def attest(ctx, key, certificate, pin, format):
             session.verify_pin(pin)
             cert = session.attest_key(key)
             certificate.write(cert.public_bytes(encoding=format))
-            logger.info(
+            log_or_echo(
                 f"Attestation certificate for slot {key.name} written to "
-                f"{_fname(certificate)}"
+                f"{_fname(certificate)}",
+                logger,
+                certificate,
             )
         except Exception:
-            raise CliFail("Attestation failed")
+            raise CliFail("Attestation failed.")
 
 
 @openpgp.group("certificates")
@@ -508,9 +594,13 @@ def export_certificate(ctx, key, format, certificate):
     try:
         cert = session.get_certificate(key)
     except ValueError:
-        raise CliFail(f"Failed to read certificate from slot {key.name}")
+        raise CliFail(f"Failed to read certificate from slot {key.name}.")
     certificate.write(cert.public_bytes(encoding=format))
-    logger.info(f"Certificate for slot {key.name} exported to {_fname(certificate)}")
+    log_or_echo(
+        f"Certificate for slot {key.name} exported to {_fname(certificate)}",
+        logger,
+        certificate,
+    )
 
 
 @certificates.command("delete")
@@ -522,7 +612,7 @@ def delete_certificate(ctx, key, admin_pin):
     Delete an OpenPGP certificate.
 
     \b
-    KEY         Key slot to delete certificate from (sig, dec, aut, or att).
+    KEY  key slot to delete certificate from (sig, dec, aut, or att)
     """
     session = ctx.obj["session"]
 
@@ -531,7 +621,7 @@ def delete_certificate(ctx, key, admin_pin):
     try:
         session.verify_admin(admin_pin)
         session.delete_certificate(key)
-        logger.info(f"Certificate for slot {key.name} deleted")
+        click.echo(f"Certificate for slot {key.name} deleted.")
     except Exception:
         raise CliFail("Failed to delete certificate.")
 
@@ -563,5 +653,6 @@ def import_certificate(ctx, key, cert, admin_pin):
     try:
         session.verify_admin(admin_pin)
         session.put_certificate(key, certs[0])
+        click.echo(f"Certificate imported into slot {key.name}")
     except Exception:
-        raise CliFail("Failed to import certificate")
+        raise CliFail("Failed to import certificate.")

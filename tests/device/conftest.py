@@ -1,15 +1,20 @@
-from ykman.device import list_all_devices, read_info
-from ykman.pcsc import list_devices
-from yubikit.core import TRANSPORT, Version, PID
-from yubikit.core.otp import OtpConnection
-from yubikit.core.fido import FidoConnection
-from yubikit.core.smartcard import SmartCardConnection
+import os
+import time
 from functools import partial
-from . import condition
 
 import pytest
-import time
-import os
+
+from ykman._cli.util import find_scp11_params
+from ykman.device import list_all_devices, read_info
+from ykman.pcsc import list_devices
+from yubikit.core import TRANSPORT, _override_version, PID
+from yubikit.core.fido import FidoConnection
+from yubikit.core.otp import OtpConnection
+from yubikit.core.smartcard import SmartCardConnection
+from yubikit.core.smartcard.scp import ScpKid
+from yubikit.management import RELEASE_TYPE
+
+from . import condition
 
 
 @pytest.fixture(scope="session")
@@ -21,6 +26,7 @@ def _device(pytestconfig):
             serial = None
         else:
             pytest.skip("No serial specified for device tests")
+
     reader = pytestconfig.getoption("reader")
     if reader:
         readers = list_devices(reader)
@@ -36,9 +42,9 @@ def _device(pytestconfig):
         dev, info = devices[0]
     if serial is not None and info.serial != serial:
         pytest.exit("Device serial does not match: %d != %r" % (serial, info.serial))
-    version = pytestconfig.getoption("use_version")
-    if version:
-        info.version = Version.from_string(version)
+
+    if info.version_qualifier.type != RELEASE_TYPE.FINAL:
+        _override_version(info.version)
 
     return dev, info
 
@@ -100,3 +106,11 @@ def ccid_connection(device, info):
             yield c
     else:
         pytest.skip("CCID connection not available")
+
+
+@pytest.fixture(scope=connection_scope)
+def scp_params(ccid_connection):
+    try:
+        return find_scp11_params(ccid_connection, ScpKid.SCP11b, 0)
+    except ValueError:
+        return None

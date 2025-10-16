@@ -25,43 +25,47 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from yubikit.core.smartcard import SmartCardConnection
-from yubikit.hsmauth import (
-    HsmAuthSession,
-    InvalidPinError,
-    ALGORITHM,
-    MANAGEMENT_KEY_LEN,
-    DEFAULT_MANAGEMENT_KEY,
-)
-from yubikit.core.smartcard import ApduError, SW
-
-from ..util import parse_private_key, InvalidPasswordError
-
-from ..hsmauth import (
-    get_hsmauth_info,
-    generate_random_management_key,
-)
-from .util import (
-    CliFail,
-    click_force_option,
-    click_postpone_execution,
-    click_callback,
-    click_format_option,
-    click_prompt,
-    click_group,
-    pretty_print,
-)
-
-from cryptography.hazmat.primitives import serialization
+import logging
+import os
 
 import click
-import os
-import logging
+from cryptography.hazmat.primitives import serialization
+
+from yubikit.core import TRANSPORT
+from yubikit.core.smartcard import SW, ApduError, SmartCardConnection
+from yubikit.hsmauth import (
+    ALGORITHM,
+    CREDENTIAL_PASSWORD_LEN,
+    MANAGEMENT_KEY_LEN,
+    HsmAuthSession,
+    InvalidPinError,
+)
+from yubikit.management import CAPABILITY
+
+from ..hsmauth import (
+    generate_random_management_key,
+    get_hsmauth_info,
+)
+from ..util import InvalidPasswordError, parse_private_key
+from .util import (
+    CliFail,
+    click_callback,
+    click_force_option,
+    click_format_option,
+    click_group,
+    click_postpone_execution,
+    click_prompt,
+    get_scp_params,
+    log_or_echo,
+    pretty_print,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def handle_credential_error(e: Exception, default_exception_msg):
+def handle_credential_error(
+    e: Exception, default_exception_msg, target="Credential password"
+):
     if isinstance(e, InvalidPinError):
         attempts = e.attempts_remaining
         if attempts:
@@ -78,7 +82,9 @@ def handle_credential_error(e: Exception, default_exception_msg):
         elif e.sw == SW.SECURITY_CONDITION_NOT_SATISFIED:
             raise CliFail("The device was not touched.")
         elif e.sw == SW.CONDITIONS_NOT_SATISFIED:
-            raise CliFail("Credential password does not meet complexity requirement.")
+            raise CliFail(f"{target} does not meet complexity requirement.")
+    elif isinstance(e, ValueError):
+        raise  # Re-raise, ValueErrors are handled elsewhere
     raise CliFail(default_exception_msg)
 
 
@@ -96,31 +102,46 @@ def _parse_algorithm(algorithm: ALGORITHM) -> str:
         return "Asymmetric"
 
 
-def _parse_key(key, key_len, key_type):
+def _parse_hex(hex):
     try:
-        key = bytes.fromhex(key)
-    except Exception:
-        ValueError(key)
+        return bytes.fromhex(hex)
+    except Exception as e:
+        raise ValueError(e)
+
+
+def _parse_key(key, key_len, key_type):
+    key = _parse_hex(key)
 
     if len(key) != key_len:
         raise ValueError(
-            f"{key_type} must be exactly {key_len} bytes long "
-            f"({key_len * 2} hexadecimal digits) long"
+            f"must be exactly {key_len} bytes long ({key_len * 2} hexadecimal digits) "
+            "long"
         )
     return key
 
 
-def _parse_hex(hex):
-    try:
-        val = bytes.fromhex(hex)
-        return val
-    except Exception:
-        raise ValueError(hex)
+def _parse_password(value, key_len, name):
+    encoded = value.encode()
+    if len(encoded) <= key_len:
+        return encoded.ljust(key_len, b"\0")
+    if len(encoded) == key_len * 2:
+        return _parse_hex(value)
+    raise ValueError(f"{name} must be at most 16 bytes")
 
 
 @click_callback()
 def click_parse_management_key(ctx, param, val):
     return _parse_key(val, MANAGEMENT_KEY_LEN, "Management key")
+
+
+@click_callback()
+def click_parse_management_password(ctx, param, val):
+    return _parse_password(val, MANAGEMENT_KEY_LEN, "Management password")
+
+
+@click_callback()
+def click_parse_credential_password(ctx, param, val):
+    return _parse_password(val, CREDENTIAL_PASSWORD_LEN, "Credential password")
 
 
 @click_callback()
@@ -143,29 +164,36 @@ def click_parse_context(ctx, param, val):
     return _parse_hex(val)
 
 
-def _prompt_management_key(prompt="Enter a management key [blank to use default key]"):
-    management_key = click_prompt(
-        prompt, default="", hide_input=True, show_default=False
+def _prompt_management_key(prompt="Enter management password", confirm=False):
+    management_password = click_prompt(
+        prompt,
+        default="",
+        hide_input=True,
+        show_default=False,
+        confirmation_prompt=confirm,
     )
-    if management_key == "":
-        return DEFAULT_MANAGEMENT_KEY
-
-    return _parse_key(management_key, MANAGEMENT_KEY_LEN, "Management key")
+    return _parse_password(
+        management_password, MANAGEMENT_KEY_LEN, "Management password"
+    )
 
 
 def _prompt_credential_password(prompt="Enter credential password"):
     credential_password = click_prompt(
-        prompt, default="", hide_input=True, show_default=False
+        prompt,
+        hide_input=True,
+        confirmation_prompt=True,
     )
 
-    return credential_password
+    return _parse_password(
+        credential_password, CREDENTIAL_PASSWORD_LEN, "Credential password"
+    )
 
 
-def _prompt_symmetric_key(type):
-    symmetric_key = click_prompt(f"Enter {type}", default="", show_default=False)
+def _prompt_symmetric_key(name):
+    symmetric_key = click_prompt(f"Enter {name}")
 
     return _parse_key(
-        symmetric_key, ALGORITHM.AES128_YUBICO_AUTHENTICATION.key_len, "ENC key"
+        symmetric_key, ALGORITHM.AES128_YUBICO_AUTHENTICATION.key_len, name
     )
 
 
@@ -174,15 +202,21 @@ def _fname(fobj):
 
 
 click_credential_password_option = click.option(
-    "-c", "--credential-password", help="password to protect credential"
+    "-c",
+    "--credential-password",
+    help="password to protect credential",
+    callback=click_parse_credential_password,
 )
 
 click_management_key_option = click.option(
     "-m",
+    "--management-password",
     "--management-key",
-    help="the management key",
-    callback=click_parse_management_key,
+    "management_key",
+    help="the management password",
+    callback=click_parse_management_password,
 )
+
 
 click_touch_option = click.option(
     "-t", "--touch", is_flag=True, help="require touch on YubiKey to access credential"
@@ -195,13 +229,28 @@ click_touch_option = click.option(
 def hsmauth(ctx):
     """
     Manage the YubiHSM Auth application
-
-
     """
     dev = ctx.obj["device"]
     conn = dev.open_connection(SmartCardConnection)
     ctx.call_on_close(conn.close)
-    ctx.obj["session"] = HsmAuthSession(conn)
+
+    scp_params = get_scp_params(ctx, CAPABILITY.HSMAUTH, conn)
+    ctx.obj["session"] = HsmAuthSession(conn, scp_params)
+
+    try:
+        if not scp_params and dev.transport == TRANSPORT.NFC:
+            # Dummy command to test access
+            ctx.obj["session"].get_management_key_retries()
+    except ApduError as e:
+        if e.sw == SW.CONDITIONS_NOT_SATISFIED:
+            raise CliFail("Unable to manage HSMAuth over NFC without SCP")
+        raise
+
+    info = ctx.obj["info"]
+    ctx.obj["fips_unready"] = (
+        CAPABILITY.HSMAUTH in info.fips_capable
+        and CAPABILITY.HSMAUTH not in info.fips_approved
+    )
 
 
 @hsmauth.command()
@@ -210,8 +259,13 @@ def info(ctx):
     """
     Display general status of the YubiHSM Auth application.
     """
-    info = get_hsmauth_info(ctx.obj["session"])
-    click.echo("\n".join(pretty_print(info)))
+    info = ctx.obj["info"]
+    data = get_hsmauth_info(ctx.obj["session"])
+    if CAPABILITY.HSMAUTH in info.fips_capable:
+        # This is a bit ugly as it makes assumptions about the structure of data
+        data["FIPS approved"] = CAPABILITY.HSMAUTH in info.fips_approved
+
+    click.echo("\n".join(pretty_print(data)))
 
 
 @hsmauth.command()
@@ -225,21 +279,21 @@ def reset(ctx, force):
     the YubiHSM Auth application on the YubiKey.
     """
 
-    force or click.confirm(
-        "WARNING! This will delete all stored YubiHSM Auth data and restore factory "
-        "setting. Proceed?",
-        abort=True,
-        err=True,
-    )
+    if not force:
+        click.confirm(
+            "WARNING! This will delete all stored YubiHSM Auth data and restore "
+            "factory setting. Proceed?",
+            abort=True,
+            err=True,
+        )
 
     click.echo("Resetting YubiHSM Auth data...")
     ctx.obj["session"].reset()
 
-    click.echo("Success! All YubiHSM Auth data have been cleared from the YubiKey.")
     click.echo(
-        "Your YubiKey now has the default Management Key"
-        f"({DEFAULT_MANAGEMENT_KEY.hex()})."
+        "Reset complete. All YubiHSM Auth data has been cleared from the YubiKey."
     )
+    click.echo("Your YubiKey now has an empty Management password.")
 
 
 @hsmauth.group()
@@ -314,11 +368,16 @@ def generate(ctx, label, credential_password, management_key, touch):
     LABEL label for the YubiHSM Auth credential
     """
 
-    if not credential_password:
-        credential_password = _prompt_credential_password()
+    if ctx.obj["fips_unready"]:
+        raise CliFail(
+            "YubiKey FIPS must be in FIPS approved mode prior to adding credentials"
+        )
 
-    if not management_key:
+    if management_key is None:
         management_key = _prompt_management_key()
+
+    if credential_password is None:
+        credential_password = _prompt_credential_password()
 
     session = ctx.obj["session"]
 
@@ -326,6 +385,7 @@ def generate(ctx, label, credential_password, management_key, touch):
         session.generate_credential_asymmetric(
             management_key, label, credential_password, touch
         )
+        click.echo("Asymmetric credential generated.")
     except Exception as e:
         handle_credential_error(
             e, default_exception_msg="Failed to generate asymmetric credential."
@@ -352,11 +412,16 @@ def import_credential(
     LABEL        label for the YubiHSM Auth credential
     PRIVATE-KEY  file containing the private key (use '-' to use stdin)
     """
-    if not credential_password:
-        credential_password = _prompt_credential_password()
+    if ctx.obj["fips_unready"]:
+        raise CliFail(
+            "YubiKey FIPS must be in FIPS approved mode prior to adding credentials"
+        )
 
-    if not management_key:
+    if management_key is None:
         management_key = _prompt_management_key()
+
+    if credential_password is None:
+        credential_password = _prompt_credential_password()
 
     session = ctx.obj["session"]
 
@@ -391,6 +456,7 @@ def import_credential(
             credential_password,
             touch,
         )
+        click.echo("Asymmetric credential imported.")
     except Exception as e:
         handle_credential_error(
             e, default_exception_msg="Failed to import asymmetric credential."
@@ -425,7 +491,11 @@ def export(ctx, label, public_key_output, format):
 
         public_key_output.write(public_key_encoded)
 
-        logger.info(f"Public key for {label} written to {_fname(public_key_output)}")
+        log_or_echo(
+            f"Public key for {label} written to {_fname(public_key_output)}",
+            logger,
+            public_key_output,
+        )
     except ApduError as e:
         if e.sw == SW.AUTH_METHOD_BLOCKED:
             raise CliFail("The entry is not an asymmetric credential.")
@@ -458,11 +528,16 @@ def symmetric(
     LABEL  label for the YubiHSM Auth credential
     """
 
-    if not credential_password:
-        credential_password = _prompt_credential_password()
+    if ctx.obj["fips_unready"]:
+        raise CliFail(
+            "YubiKey FIPS must be in FIPS approved mode prior to adding credentials"
+        )
 
-    if not management_key:
+    if management_key is None:
         management_key = _prompt_management_key()
+
+    if credential_password is None:
+        credential_password = _prompt_credential_password()
 
     if generate and (enc_key or mac_key):
         ctx.fail("--enc-key and --mac-key cannot be combined with --generate")
@@ -490,6 +565,7 @@ def symmetric(
             credential_password,
             touch,
         )
+        click.echo("Symmetric credential stored.")
 
     except Exception as e:
         handle_credential_error(
@@ -516,15 +592,22 @@ def derive(ctx, label, derivation_password, credential_password, management_key,
     LABEL  label for the YubiHSM Auth credential
     """
 
-    if not credential_password:
-        credential_password = _prompt_credential_password()
+    if ctx.obj["fips_unready"]:
+        raise CliFail(
+            "YubiKey FIPS must be in FIPS approved mode prior to adding credentials"
+        )
 
-    if not management_key:
+    if management_key is None:
         management_key = _prompt_management_key()
 
-    if not derivation_password:
+    if credential_password is None:
+        credential_password = _prompt_credential_password()
+
+    if derivation_password is None:
         derivation_password = click_prompt(
-            "Enter derivation password", default="", show_default=False
+            "Enter derivation password",
+            hide_input=True,
+            confirmation_prompt=True,
         )
 
     session = ctx.obj["session"]
@@ -533,6 +616,7 @@ def derive(ctx, label, derivation_password, credential_password, management_key,
         session.put_credential_derived(
             management_key, label, derivation_password, credential_password, touch
         )
+        click.echo("Derived symmetric credential stored.")
     except Exception as e:
         handle_credential_error(
             e, default_exception_msg="Failed to import symmetric credential."
@@ -554,19 +638,21 @@ def delete(ctx, label, management_key, force):
     LABEL a label to match a single credential (as shown in "list")
     """
 
-    if not management_key:
+    if management_key is None:
         management_key = _prompt_management_key()
 
-    force or click.confirm(
-        f"Delete credential: {label} ?",
-        abort=True,
-        err=True,
-    )
+    if not force:
+        click.confirm(
+            f"Delete credential: {label} ?",
+            abort=True,
+            err=True,
+        )
 
     session = ctx.obj["session"]
 
     try:
         session.delete_credential(management_key, label)
+        click.echo("Credential deleted.")
     except Exception as e:
         handle_credential_error(
             e,
@@ -579,13 +665,12 @@ def access():
     """Manage Management Key for YubiHSM Auth"""
 
 
-@access.command()
+@access.command(hidden=True)
 @click.pass_context
 @click.option(
     "-m",
     "--management-key",
     help="current management key",
-    default=DEFAULT_MANAGEMENT_KEY,
     show_default=True,
     callback=click_parse_management_key,
 )
@@ -599,8 +684,7 @@ def access():
     "-g",
     "--generate",
     is_flag=True,
-    help="generate a random management key "
-    "(can't be used with --new-management-key)",
+    help="generate a random management key (can't be used with --new-management-key)",
 )
 def change_management_key(ctx, management_key, new_management_key, generate):
     """
@@ -610,7 +694,7 @@ def change_management_key(ctx, management_key, new_management_key, generate):
     YubiHSM Auth credentials stored on the YubiKey.
     """
 
-    if not management_key:
+    if management_key is None:
         management_key = _prompt_management_key(
             "Enter current management key [blank to use default key]"
         )
@@ -621,7 +705,7 @@ def change_management_key(ctx, management_key, new_management_key, generate):
     if new_management_key and generate:
         ctx.fail("Invalid options: --new-management-key conflicts with --generate")
 
-    if not new_management_key:
+    if new_management_key is None:
         if generate:
             new_management_key = generate_random_management_key()
             click.echo(f"Generated management key: {new_management_key.hex()}")
@@ -645,7 +729,57 @@ def change_management_key(ctx, management_key, new_management_key, generate):
 
     try:
         session.put_management_key(management_key, new_management_key)
+        click.echo("Management key changed.")
     except Exception as e:
         handle_credential_error(
-            e, default_exception_msg="Failed to change management key."
+            e,
+            default_exception_msg="Failed to change management key.",
+            target="Management key",
+        )
+
+
+@access.command()
+@click.pass_context
+@click.option(
+    "-m",
+    "--management-password",
+    "management_key",
+    help="current management password",
+    show_default=True,
+    callback=click_parse_management_password,
+)
+@click.option(
+    "-n",
+    "--new-management-password",
+    "new_management_key",
+    help="a new management password to set",
+    callback=click_parse_management_password,
+)
+def change_management_password(ctx, management_key, new_management_key):
+    """
+    Change the management key.
+
+    Allows you to change the management key which is required to add and delete
+    YubiHSM Auth credentials stored on the YubiKey.
+    """
+
+    if management_key is None:
+        management_key = _prompt_management_key(
+            "Enter your current management password",
+        )
+
+    if new_management_key is None:
+        new_management_key = _prompt_management_key(
+            "Enter a new management password", confirm=True
+        )
+
+    session = ctx.obj["session"]
+    try:
+        session.put_management_key(management_key, new_management_key)
+        click.echo("Management password changed.")
+    except Exception as e:
+        handle_credential_error(
+            e,
+            default_exception_msg="Failed to change management password.",
+            target="Management password",
         )

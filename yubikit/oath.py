@@ -1,27 +1,30 @@
-from .core import (
-    int2bytes,
-    bytes2int,
-    require_version,
-    Version,
-    Tlv,
-    BadResponseError,
-)
-from .core.smartcard import AID, SmartCardConnection, SmartCardProtocol
+from __future__ import annotations
 
-from urllib.parse import unquote, urlparse, parse_qs
-from functools import total_ordering
-from enum import IntEnum, unique
-from dataclasses import dataclass
-from base64 import b64encode, b32decode
-from time import time
-from typing import Optional, List, Mapping
-
-import hmac
 import hashlib
-import struct
+import hmac
+import logging
 import os
 import re
-import logging
+import struct
+from base64 import b32decode, b64encode
+from dataclasses import dataclass
+from enum import IntEnum, unique
+from functools import total_ordering
+from time import time
+from typing import Mapping
+from urllib.parse import parse_qs, unquote, urlparse
+
+from .core import (
+    BadResponseError,
+    NotSupportedError,
+    Tlv,
+    Version,
+    _override_version,
+    bytes2int,
+    int2bytes,
+    require_version,
+)
+from .core.smartcard import AID, ScpKeyParams, SmartCardConnection, SmartCardProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +95,7 @@ def parse_b32_key(key: str):
 def _parse_select(response):
     data = Tlv.parse_dict(response)
     return (
-        Version.from_bytes(data[TAG_VERSION]),
+        _override_version.patch(Version.from_bytes(data[TAG_VERSION])),
         data.get(TAG_NAME),
         data.get(TAG_CHALLENGE),
     )
@@ -109,10 +112,10 @@ class CredentialData:
     digits: int = DEFAULT_DIGITS
     period: int = DEFAULT_PERIOD
     counter: int = DEFAULT_IMF
-    issuer: Optional[str] = None
+    issuer: str | None = None
 
     @classmethod
-    def parse_uri(cls, uri: str) -> "CredentialData":
+    def parse_uri(cls, uri: str) -> CredentialData:
         """Parse OATH credential data from URI.
 
         :param uri: The URI to parse from.
@@ -162,11 +165,11 @@ class Credential:
 
     device_id: str
     id: bytes
-    issuer: Optional[str]
+    issuer: str | None
     name: str
     oath_type: OATH_TYPE
     period: int
-    touch_required: Optional[bool]
+    touch_required: bool | None
 
     def __lt__(self, other):
         a = ((self.issuer or self.name).lower(), self.name.lower())
@@ -262,15 +265,26 @@ def _format_code(credential, timestamp, truncated):
 class OathSession:
     """A session with the OATH application."""
 
-    def __init__(self, connection: SmartCardConnection):
+    def __init__(
+        self,
+        connection: SmartCardConnection,
+        scp_key_params: ScpKeyParams | None = None,
+    ):
         self.protocol = SmartCardProtocol(connection, INS_SEND_REMAINING)
         self._version, self._salt, self._challenge = _parse_select(
             self.protocol.select(AID.OATH)
         )
+        self.protocol.configure(self.version)
+
+        if scp_key_params:
+            if (5, 0, 0) <= self._version < (5, 6, 3):
+                raise NotSupportedError("SCP for OATH requires YubiKey 5.6.3 or later")
+            self.protocol.init_scp(scp_key_params)
+        self._scp_params = scp_key_params
+
         self._has_key = self._challenge is not None
         self._device_id = _get_device_id(self._salt)
-        self.protocol.enable_touch_workaround(self._version)
-        self._neo_unlock_workaround = self.version < (3, 0, 0)
+        self._neo_unlock_workaround = not scp_key_params and self.version < (3, 0, 0)
         logger.debug(
             f"OATH session initialized (version={self.version}, "
             f"has_key={self._has_key})"
@@ -278,34 +292,39 @@ class OathSession:
 
     @property
     def version(self) -> Version:
-        """The OATH application version."""
+        """The version of the OATH application."""
         return self._version
 
     @property
     def device_id(self) -> str:
-        """The device ID."""
+        """The device ID.
+
+        A random static identifier that is re-generated on reset.
+        """
         return self._device_id
 
     @property
     def has_key(self) -> bool:
-        """If True, the YubiKey has an access key."""
+        """If True, the YubiKey has an access key set."""
         return self._has_key
 
     @property
     def locked(self) -> bool:
-        """If True, the OATH application is password protected."""
+        """If True, the OATH application is currently locked via an access key."""
         return self._challenge is not None
 
     def reset(self) -> None:
         """Perform a factory reset on the OATH application."""
         self.protocol.send_apdu(0, INS_RESET, 0xDE, 0xAD)
         _, self._salt, self._challenge = _parse_select(self.protocol.select(AID.OATH))
+        if self._scp_params:
+            self.protocol.init_scp(self._scp_params)
         logger.info("OATH application data reset performed")
         self._has_key = False
         self._device_id = _get_device_id(self._salt)
 
     def derive_key(self, password: str) -> bytes:
-        """Derive a key from password.
+        """Derive an access key from a password.
 
         :param password: The derivation password.
         """
@@ -313,6 +332,8 @@ class OathSession:
 
     def validate(self, key: bytes) -> None:
         """Validate authentication with access key.
+
+        This unlocks the session for use.
 
         :param key: The access key.
         """
@@ -330,7 +351,7 @@ class OathSession:
         self._neo_unlock_workaround = False
 
     def set_key(self, key: bytes) -> None:
-        """Set access key for authentication.
+        """Set an access key for authentication.
 
         :param key: The access key.
         """
@@ -355,9 +376,9 @@ class OathSession:
             self.validate(key)
 
     def unset_key(self) -> None:
-        """Remove access code.
+        """Remove the access key.
 
-        WARNING: This removes authentication.
+        This removes the need to authentication a session before using it.
         """
         self.protocol.send_apdu(0, INS_SET_CODE, 0, 0, Tlv(TAG_KEY))
         logger.info("Access code removed")
@@ -366,7 +387,7 @@ class OathSession:
     def put_credential(
         self, credential_data: CredentialData, touch_required: bool = False
     ) -> Credential:
-        """Add a OATH credential.
+        """Add an OATH credential.
 
         :param credential_data: The credential data.
         :param touch_required: The touch policy.
@@ -405,7 +426,7 @@ class OathSession:
         )
 
     def rename_credential(
-        self, credential_id: bytes, name: str, issuer: Optional[str] = None
+        self, credential_id: bytes, name: str, issuer: str | None = None
     ) -> bytes:
         """Rename a OATH credential.
 
@@ -413,6 +434,7 @@ class OathSession:
         :param name: The new name of the credential.
         :param issuer: The credential issuer.
         """
+        logger.debug(f"Renaming credential '{credential_id!r}' to '{issuer}:{name}'")
         require_version(self.version, (5, 3, 1))
         _, _, period = _parse_cred_id(credential_id, OATH_TYPE.TOTP)
         new_id = _format_cred_id(issuer, name, OATH_TYPE.TOTP, period)
@@ -422,8 +444,9 @@ class OathSession:
         logger.info("Credential renamed")
         return new_id
 
-    def list_credentials(self) -> List[Credential]:
+    def list_credentials(self) -> list[Credential]:
         """List OATH credentials."""
+        logger.debug("Listing OATH credentials...")
         creds = []
         for tlv in Tlv.parse_list(self.protocol.send_apdu(0, INS_LIST, 0, 0)):
             data = Tlv.unpack(TAG_NAME_LIST, tlv)
@@ -443,6 +466,7 @@ class OathSession:
         :param credential_id: The id of the credential.
         :param challenge: The challenge.
         """
+        logger.debug(f"Calculating response for credential: {credential_id!r}")
         resp = Tlv.unpack(
             TAG_RESPONSE,
             self.protocol.send_apdu(
@@ -460,15 +484,18 @@ class OathSession:
 
         :param credential_id: The id of the credential.
         """
+        logger.debug(f"Deleting crededential: {credential_id!r}")
         self.protocol.send_apdu(0, INS_DELETE, 0, 0, Tlv(TAG_NAME, credential_id))
         logger.info("Credential deleted")
 
     def calculate_all(
-        self, timestamp: Optional[int] = None
-    ) -> Mapping[Credential, Optional[Code]]:
+        self, timestamp: int | None = None
+    ) -> Mapping[Credential, Code | None]:
         """Calculate codes for all OATH credentials on the YubiKey.
 
-        :param timestamp: A timestamp.
+        This excludes credentials which require touch as well as HOTP credentials.
+
+        :param timestamp: A timestamp used for the TOTP challenge.
         """
         timestamp = int(timestamp or time())
         challenge = _get_challenge(timestamp, DEFAULT_PERIOD)
@@ -505,7 +532,7 @@ class OathSession:
         return entries
 
     def calculate_code(
-        self, credential: Credential, timestamp: Optional[int] = None
+        self, credential: Credential, timestamp: int | None = None
     ) -> Code:
         """Calculate code for an OATH credential.
 

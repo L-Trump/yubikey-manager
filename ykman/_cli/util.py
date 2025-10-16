@@ -26,18 +26,26 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 import functools
-import click
+import logging
 import sys
-from yubikit.management import DeviceInfo
-from yubikit.oath import parse_b32_key
 from collections import OrderedDict
 from collections.abc import MutableMapping
-from cryptography.hazmat.primitives import serialization
-from contextlib import contextmanager
-from threading import Timer
 from enum import Enum
-from typing import List
-import logging
+from typing import Sequence, cast
+
+import click
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
+
+from yubikit.core import TRANSPORT, ApplicationNotAvailableError, _timeout
+from yubikit.core.smartcard import ApduError, SmartCardConnection
+from yubikit.core.smartcard.scp import KeyRef, Scp11KeyParams, ScpKeyParams, ScpKid
+from yubikit.management import CAPABILITY, DeviceInfo
+from yubikit.oath import parse_b32_key
+from yubikit.securitydomain import SecurityDomainSession
+
+from ..util import parse_certificates
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +65,7 @@ class _YkmanCommand(click.Command):
 
     def get_help_option(self, ctx):
         option = super().get_help_option(ctx)
+        assert option is not None  # noqa: S101
         option.help = "show this message and exit"
         return option
 
@@ -133,6 +142,22 @@ class EnumChoice(click.Choice):
             self.choices = self.choices_names
 
         return self.choices_enum[name]
+
+
+class HexIntParamType(click.ParamType):
+    name = "integer"
+
+    def convert(self, value, param, ctx):
+        if isinstance(value, int):
+            return value
+        try:
+            if value.lower().startswith("0x"):
+                return int(value[2:], 16)
+            if ":" in value:
+                return int(value.replace(":", ""), 16)
+            return int(value)
+        except ValueError:
+            self.fail(f"{value!r} is not a valid integer", param, ctx)
 
 
 def click_callback(invoke_on_missing=False):
@@ -244,22 +269,16 @@ def click_prompt(prompt, err=True, **kwargs):
     return click.prompt(prompt, err=err, **kwargs)
 
 
-def prompt_for_touch():
+def prompt_for_touch(prompt: str = "Touch your YubiKey...") -> None:
     logger.debug("Prompting user to touch YubiKey...")
     try:
-        click.echo("Touch your YubiKey...", err=True)
+        click.echo(prompt, err=True)
     except Exception:
-        sys.stderr.write("Touch your YubiKey...\n")
+        sys.stderr.write(f"{prompt}\n")
 
 
-@contextmanager
 def prompt_timeout(timeout=0.5):
-    timer = Timer(timeout, prompt_for_touch)
-    try:
-        timer.start()
-        yield None
-    finally:
-        timer.cancel()
+    return _timeout(prompt_for_touch, timeout)
 
 
 class CliFail(Exception):
@@ -268,13 +287,13 @@ class CliFail(Exception):
         self.status = status
 
 
-def pretty_print(value, level: int = 0) -> List[str]:
+def pretty_print(value, level: int = 0) -> Sequence[str]:
     """Pretty-prints structured data, as that returned by get_diagnostics.
 
     Returns a list of strings which can be printed as lines.
     """
     indent = "  " * level
-    lines = []
+    lines: list[str] = []
     if isinstance(value, list):
         for v in value:
             lines.extend(pretty_print(v, level))
@@ -308,3 +327,138 @@ def pretty_print(value, level: int = 0) -> List[str]:
 
 def is_yk4_fips(info: DeviceInfo) -> bool:
     return info.version[0] == 4 and info.is_fips
+
+
+def _fileno(f) -> int:
+    try:
+        return f.fileno()
+    except Exception:
+        return -1
+
+
+def log_or_echo(message: str, log: logging.Logger, *files) -> None:
+    fno = _fileno(sys.stdout)
+    if any(_fileno(f) == fno for f in files):
+        log.info(message)
+    else:
+        click.echo(f"{message}.")
+
+
+def find_scp11_params(
+    connection: SmartCardConnection, kid: int, kvn: int, ca: bytes | None = None
+) -> Scp11KeyParams:
+    try:
+        scp = SecurityDomainSession(connection)
+    except ApplicationNotAvailableError:
+        raise ValueError("Security Domain application not available")
+
+    if ca:
+        root_ca = parse_certificates(ca, None)[0]
+        try:
+            ski = root_ca.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+        except x509.ExtensionNotFound:
+            ski = None
+    else:
+        root_ca = None
+        ski = None
+
+    if not kvn:
+        if ski:
+            # Find by CA
+            ca_ski = ski.value.digest
+            for ref, ca_check in scp.get_supported_ca_identifiers(klcc=True).items():
+                if ca_check == ca_ski:
+                    if not kid or ref.kid == kid:
+                        kid, kvn = ref
+                        break
+            else:
+                raise ValueError(f"No CA identifier found matching SKI: {ca_ski.hex()}")
+        # Find any matching KID
+        for ref in scp.get_key_information().keys():
+            if ref.kid == kid:
+                kvn = ref.kvn
+                break
+        else:
+            raise ValueError(f"No SCP key found matching KID=0x{kid:x}")
+
+    ref = KeyRef(kid, kvn)
+    try:
+        chain = scp.get_certificate_bundle(ref)
+        if not chain:
+            raise ValueError(f"No certificate chain stored for {ref}")
+        if root_ca:
+            logger.debug("Validating KLCC CA using supplied file")
+            parent = root_ca
+            for cert in chain:
+                # Requires cryptography >= 40
+                cert.verify_directly_issued_by(parent)
+                parent = cert
+            logger.info("KLCC CA validated")
+        else:
+            logger.info("No CA supplied, skipping KLCC CA validation")
+
+        pub_key = cast(EllipticCurvePublicKey, chain[-1].public_key())
+        return Scp11KeyParams(ref, pub_key)
+    except ApduError:
+        raise ValueError(f"Unable to get SCP key paramaters ({ref})")
+
+
+def get_scp_params(
+    ctx: click.Context, capability: CAPABILITY, connection: SmartCardConnection
+) -> ScpKeyParams | None:
+    # Explicit SCP
+    resolve = ctx.obj.get("scp")
+    if resolve:
+        return resolve(connection)
+
+    # Automatic SCP11b if needed
+    info = ctx.obj["info"]
+    if connection.transport == TRANSPORT.NFC and capability in info.fips_capable:
+        logger.debug("Attempt to find SCP11b key")
+        try:
+            params = find_scp11_params(connection, ScpKid.SCP11b, 0)
+            logger.info("SCP11b key found, using for FIPS capable applications")
+            return params
+        except ValueError:
+            logger.debug("No SCP11b key found, not using SCP")
+
+    return None
+
+
+def organize_scp11_certificates(
+    certificates: Sequence[x509.Certificate],
+) -> tuple[
+    x509.Certificate | None, Sequence[x509.Certificate], x509.Certificate | None
+]:
+    if not certificates:
+        return None, [], None
+
+    # Order leaf-last
+    ordered, certificates = [certificates[0]], list(certificates[1:])
+    while certificates:
+        for c in certificates:
+            if c.subject == ordered[0].issuer:
+                certificates.remove(c)
+                ordered.insert(0, c)
+                break
+            if ordered[-1].subject == c.issuer:
+                certificates.remove(c)
+                ordered.append(c)
+                break
+        else:
+            raise ValueError("Incomplete chain of certificates")
+
+    ca, leaf = None, None
+
+    # Check if root is self-signed:
+    peek = ordered[0]
+    if peek.issuer == peek.subject:
+        ca = ordered.pop(0)
+
+    # Check if leaf has keyAgreement policy:
+    if ordered:
+        kue = ordered[-1].extensions.get_extension_for_class(x509.KeyUsage)
+        if kue.value.key_agreement:
+            leaf = ordered.pop()
+
+    return ca, ordered, leaf

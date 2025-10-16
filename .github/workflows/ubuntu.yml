@@ -2,6 +2,8 @@ name: Ubuntu
 
 on: [push, pull_request]
 
+permissions: read-all
+
 jobs:
   build:
 
@@ -10,34 +12,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12.2'
-          cache: poetry
+          python-version-file: ".python-version"
 
       - name: Install dependencies
         run: |
           sudo apt-get install -qq swig libpcsclite-dev
-          poetry install
 
-      # - name: Run unit tests
-      #   run: poetry run pytest
+      - name: Install the project
+        run: uv sync --locked
 
-      - name: Run CLI
+      - name: Run pre-commit hooks
         run: |
-          poetry build
-          pip install dist/canokey*.whl
-          ckman --version
-          [[ -z "$(ckman --version | grep -E "not found|missing")" ]]
+          uv tool install pre-commit
+          pre-commit run --all-files --verbose
+
+      - name: Run unit tests
+        run: uv run pytest
 
       - name: PyInstaller
         run: |
-          poetry run pyinstaller ykman.spec
-          dist/ckman/ckman --version
+          uv run pyinstaller ykman.spec
+          dist/ykman/ckman --version
           [[ -z "$(dist/ckman/ckman --version | grep -E "not found|missing")" ]]
           export REF=$(echo ${GITHUB_REF} | cut -d '/' -f 3)
           mv dist/ckman dist/ckman-$REF

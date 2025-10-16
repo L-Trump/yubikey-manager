@@ -25,59 +25,58 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from base64 import b32encode
-from yubikit.yubiotp import (
-    SLOT,
-    NDEF_TYPE,
-    YubiOtpSession,
-    YubiOtpSlotConfiguration,
-    HmacSha1SlotConfiguration,
-    StaticPasswordSlotConfiguration,
-    HotpSlotConfiguration,
-    UpdateConfiguration,
-)
-from yubikit.core import TRANSPORT, CommandError
-from yubikit.core.otp import (
-    MODHEX_ALPHABET,
-    modhex_encode,
-    modhex_decode,
-    OtpConnection,
-)
-from yubikit.core.smartcard import SmartCardConnection
-
-from .util import (
-    CliFail,
-    click_group,
-    click_force_option,
-    click_callback,
-    click_parse_b32_key,
-    click_postpone_execution,
-    click_prompt,
-    prompt_for_touch,
-    EnumChoice,
-    is_yk4_fips,
-)
-from .. import __version__
-from ..scancodes import encode, KEYBOARD_LAYOUT
-from ..otp import (
-    _PrepareUploadFailed,
-    _prepare_upload_key,
-    is_in_fips_mode,
-    generate_static_pw,
-    parse_oath_key,
-    parse_b32_key,
-    time_challenge,
-    format_oath_code,
-    format_csv,
-)
-from threading import Event
-from time import time
 import logging
 import os
 import struct
-import click
-import webbrowser
+from base64 import b32encode
+from threading import Event
+from time import time
 
+import click
+
+from yubikit.core import TRANSPORT, CommandError
+from yubikit.core.otp import (
+    MODHEX_ALPHABET,
+    OtpConnection,
+    modhex_decode,
+    modhex_encode,
+)
+from yubikit.core.smartcard import SmartCardConnection
+from yubikit.management import CAPABILITY
+from yubikit.yubiotp import (
+    NDEF_TYPE,
+    SLOT,
+    HmacSha1SlotConfiguration,
+    HotpSlotConfiguration,
+    StaticPasswordSlotConfiguration,
+    UpdateConfiguration,
+    YubiOtpSession,
+    YubiOtpSlotConfiguration,
+)
+
+from ..otp import (
+    format_csv,
+    format_oath_code,
+    generate_static_pw,
+    is_in_fips_mode,
+    parse_b32_key,
+    parse_oath_key,
+    time_challenge,
+)
+from ..scancodes import KEYBOARD_LAYOUT, encode
+from .util import (
+    CliFail,
+    EnumChoice,
+    click_callback,
+    click_force_option,
+    click_group,
+    click_parse_b32_key,
+    click_postpone_execution,
+    click_prompt,
+    is_yk4_fips,
+    log_or_echo,
+    prompt_for_touch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +105,13 @@ def parse_access_code_hex(access_code_hex):
 
 click_slot_argument = click.argument(
     "slot", type=click.Choice(["1", "2"]), callback=lambda c, p, v: SLOT(int(v))
+)
+
+click_enter_option = click.option(
+    "--enter/--no-enter",
+    default=True,
+    show_default=True,
+    help="send an Enter keystroke after slot output",
 )
 
 
@@ -193,21 +199,45 @@ def otp(ctx, access_code):
         try:
             access_code = parse_access_code_hex(access_code)
         except Exception as e:
-            ctx.fail(f"Failed to parse access code: {e}")
+            raise CliFail(f"Failed to parse access code: {e}")
 
     ctx.obj["access_code"] = access_code
 
 
-def _get_session(ctx, types=[OtpConnection, SmartCardConnection]):
+def _get_session(ctx, types=None):
     dev = ctx.obj["device"]
+    info = ctx.obj["info"]
+    if not types:
+        if info.version >= (5, 4, 3):
+            # Prefer SmartCardConnection on newer keys
+            types = [SmartCardConnection, OtpConnection]
+        else:
+            types = [OtpConnection, SmartCardConnection]
+
+    resolve_scp = ctx.obj.get("scp")
+    if resolve_scp:
+        if SmartCardConnection in types:
+            types = [SmartCardConnection]
+        else:
+            raise CliFail("SCP can only be used with SmartCardConnection")
+
     for conn_type in types:
         if dev.supports_connection(conn_type):
-            conn = dev.open_connection(conn_type)
-            ctx.call_on_close(conn.close)
-            return YubiOtpSession(conn)
+            try:
+                conn = dev.open_connection(conn_type)
+                ctx.call_on_close(conn.close)
+                if resolve_scp:
+                    scp_params = resolve_scp(conn)
+                else:
+                    scp_params = None
+                return YubiOtpSession(conn, scp_params)
+            except Exception as e:
+                logger.warning("Failed to open connection: %s", e)
+                continue
+
     raise CliFail(
         "The connection type required for this command is not supported/enabled on the "
-        "YubiKey"
+        "YubiKey."
     )
 
 
@@ -219,8 +249,8 @@ def info(ctx):
     """
     session = _get_session(ctx)
     state = session.get_config_state()
-    slot1 = state.is_configured(1)
-    slot2 = state.is_configured(2)
+    slot1 = state.is_configured(SLOT.ONE)
+    slot2 = state.is_configured(SLOT.TWO)
 
     click.echo(f"Slot 1: {slot1 and 'programmed' or 'empty'}")
     click.echo(f"Slot 2: {slot2 and 'programmed' or 'empty'}")
@@ -237,15 +267,16 @@ def swap(ctx, force):
     Swaps the two slot configurations.
     """
     session = _get_session(ctx)
-    force or click.confirm(
-        "Swap the two slots of the YubiKey?",
-        abort=True,
-        err=True,
-    )
+    if not force:
+        click.confirm(
+            "Swap the two slots of the YubiKey?",
+            abort=True,
+            err=True,
+        )
 
-    click.echo("Swapping slots...")
     try:
         session.swap_slots()
+        click.echo("Slots swapped.")
     except CommandError:
         raise CliFail(_WRITE_FAIL_MSG)
 
@@ -282,6 +313,12 @@ def ndef(ctx, slot, prefix, ndef_type):
 
     try:
         session.set_ndef_configuration(slot, prefix, ctx.obj["access_code"], ndef_type)
+
+        if CAPABILITY.OTP not in info.config.enabled_capabilities[TRANSPORT.NFC]:
+            logger.warning(
+                "NDEF is currently disabled. Enable using 'ykman config nfc -e otp'"
+            )
+        click.echo("NDEF configuration updated.")
     except CommandError:
         raise CliFail(_WRITE_FAIL_MSG)
 
@@ -298,14 +335,15 @@ def delete(ctx, slot, force):
     state = session.get_config_state()
     if not force and not state.is_configured(slot):
         raise CliFail("Not possible to delete an empty slot.")
-    force or click.confirm(
-        f"Do you really want to delete the configuration of slot {slot}?",
-        abort=True,
-        err=True,
-    )
-    click.echo(f"Deleting the configuration in slot {slot}...")
+    if not force:
+        click.confirm(
+            f"Do you really want to delete the configuration of slot {slot}?",
+            abort=True,
+            err=True,
+        )
     try:
         session.delete_slot(slot, ctx.obj["access_code"])
+        click.echo(f"Configuration slot {slot} deleted.")
     except CommandError:
         raise CliFail(_WRITE_FAIL_MSG)
 
@@ -335,11 +373,7 @@ def delete(ctx, slot, force):
     callback=parse_hex(16),
     help="16 byte secret key",
 )
-@click.option(
-    "--no-enter",
-    is_flag=True,
-    help="don't send an Enter keystroke after emitting the OTP",
-)
+@click_enter_option
 @click.option(
     "-S",
     "--serial-public-id",
@@ -366,7 +400,7 @@ def delete(ctx, slot, force):
     "--upload",
     is_flag=True,
     required=False,
-    help="upload credential to YubiCloud (opens a browser, can't be used with --force)",
+    hidden=True,
 )
 @click.option(
     "-O",
@@ -383,7 +417,7 @@ def yubiotp(
     public_id,
     private_id,
     key,
-    no_enter,
+    enter,
     force,
     serial_public_id,
     generate_private_id,
@@ -395,33 +429,39 @@ def yubiotp(
     Program a Yubico OTP credential.
     """
 
-    info = ctx.obj["info"]
     session = _get_session(ctx)
     serial = None
 
+    if upload:
+        raise CliFail(
+            "Automated YubiCloud upload support has been ended. "
+            "You can manually upload a credential by saving it as a CSV file "
+            "(use -O/--config-output) and then submitting it to "
+            "https://upload.yubico.com."
+        )
+
     if public_id and serial_public_id:
-        ctx.fail("Invalid options: --public-id conflicts with --serial-public-id.")
+        raise CliFail("Invalid options: --public-id conflicts with --serial-public-id.")
 
     if private_id and generate_private_id:
-        ctx.fail("Invalid options: --private-id conflicts with --generate-public-id.")
-
-    if upload and force:
-        ctx.fail("Invalid options: --upload conflicts with --force.")
+        raise CliFail(
+            "Invalid options: --private-id conflicts with --generate-public-id."
+        )
 
     if key and generate_key:
-        ctx.fail("Invalid options: --key conflicts with --generate-key.")
+        raise CliFail("Invalid options: --key conflicts with --generate-key.")
 
     if not public_id:
         if serial_public_id:
             try:
                 serial = session.get_serial()
             except CommandError:
-                raise CliFail("Serial number not set, public ID must be provided")
+                raise CliFail("Serial number not set, public ID must be provided.")
 
             public_id = modhex_encode(b"\xff\x00" + struct.pack(b">I", serial))
             click.echo(f"Using YubiKey serial as public ID: {public_id}")
         elif force:
-            ctx.fail(
+            raise CliFail(
                 "Public ID not given. Remove the --force flag, or "
                 "add the --serial-public-id flag or --public-id option."
             )
@@ -429,18 +469,18 @@ def yubiotp(
             public_id = click_prompt("Enter public ID")
 
     if len(public_id) % 2:
-        ctx.fail("Invalid public ID, length must be a multiple of 2.")
+        raise CliFail("Invalid public ID, length must be a multiple of 2.")
     try:
-        public_id = modhex_decode(public_id)
+        public_id_bytes = modhex_decode(public_id)
     except ValueError:
-        ctx.fail(f"Invalid public ID, must be modhex ({MODHEX_ALPHABET}).")
+        raise CliFail(f"Invalid public ID, must be modhex ({MODHEX_ALPHABET}).")
 
     if not private_id:
         if generate_private_id:
             private_id = os.urandom(6)
             click.echo(f"Using a randomly generated private ID: {private_id.hex()}")
         elif force:
-            ctx.fail(
+            raise CliFail(
                 "Private ID not given. Remove the --force flag, or "
                 "add the --generate-private-id flag or --private-id option."
             )
@@ -453,7 +493,7 @@ def yubiotp(
             key = os.urandom(16)
             click.echo(f"Using a randomly generated secret key: {key.hex()}")
         elif force:
-            ctx.fail(
+            raise CliFail(
                 "Secret key not given. Remove the --force flag, or "
                 "add the --generate-key flag or --key option."
             )
@@ -461,34 +501,16 @@ def yubiotp(
             key = click_prompt("Enter secret key")
             key = bytes.fromhex(key)
 
-    if upload:
-        click.confirm("Upload credential to YubiCloud?", abort=True, err=True)
-
-        try:
-            upload_url = _prepare_upload_key(
-                key,
-                public_id,
-                private_id,
-                serial=info.serial,
-                user_agent="ykman/" + __version__,
-            )
-            click.echo("Upload to YubiCloud initiated successfully.")
-            logger.info("Initiated YubiCloud upload")
-        except _PrepareUploadFailed as e:
-            error_msg = "\n".join(e.messages())
-            raise CliFail("Upload to YubiCloud failed.\n" + error_msg)
-
-    force or click.confirm(
-        f"Program a YubiOTP credential in slot {slot}?", abort=True, err=True
-    )
+    if not force:
+        click.confirm(
+            f"Program a YubiOTP credential in slot {slot}?", abort=True, err=True
+        )
 
     access_code = ctx.obj["access_code"]
     try:
         session.put_configuration(
             slot,
-            YubiOtpSlotConfiguration(public_id, private_id, key).append_cr(
-                not no_enter
-            ),
+            YubiOtpSlotConfiguration(public_id_bytes, private_id, key).append_cr(enter),
             access_code,
             access_code,
         )
@@ -497,14 +519,13 @@ def yubiotp(
 
     if config_output:
         serial = serial or session.get_serial()
-        csv = format_csv(serial, public_id, private_id, key, access_code)
+        csv = format_csv(serial, public_id_bytes, private_id, key, access_code)
         config_output.write(csv + "\n")
-        logger.info(f"Configuration parameters written to {_fname(config_output)}")
-
-    if upload:
-        logger.info("Launching browser for YubiCloud upload")
-        click.echo("Opening upload form in browser: " + upload_url)
-        webbrowser.open_new_tab(upload_url)
+        log_or_echo(
+            f"Configuration parameters written to {_fname(config_output)}",
+            logger,
+            config_output,
+        )
 
 
 @otp.command()
@@ -528,14 +549,10 @@ def yubiotp(
     show_default=True,
     help="keyboard layout to use for the static password",
 )
-@click.option(
-    "--no-enter",
-    is_flag=True,
-    help="don't send an Enter keystroke after outputting the password",
-)
+@click_enter_option
 @click_force_option
 @click.pass_context
-def static(ctx, slot, password, generate, length, keyboard_layout, no_enter, force):
+def static(ctx, slot, password, generate, length, keyboard_layout, enter, force):
     """
     Configure a static password.
 
@@ -549,9 +566,9 @@ def static(ctx, slot, password, generate, length, keyboard_layout, no_enter, for
     session = _get_session(ctx)
 
     if password and len(password) > 38:
-        ctx.fail("Password too long (maximum length is 38 characters).")
+        raise CliFail("Password too long (maximum length is 38 characters).")
     if generate and not length:
-        ctx.fail("Provide a length for the generated password.")
+        raise CliFail("Provide a length for the generated password.")
 
     if not password and not generate:
         password = click_prompt("Enter a static password")
@@ -565,10 +582,11 @@ def static(ctx, slot, password, generate, length, keyboard_layout, no_enter, for
     try:
         session.put_configuration(
             slot,
-            StaticPasswordSlotConfiguration(scan_codes).append_cr(not no_enter),
+            StaticPasswordSlotConfiguration(scan_codes).append_cr(enter),
             ctx.obj["access_code"],
             ctx.obj["access_code"],
         )
+        click.echo(f"Static password stored in slot {slot}.")
     except CommandError:
         raise CliFail(_WRITE_FAIL_MSG)
 
@@ -611,14 +629,14 @@ def chalresp(ctx, slot, key, totp, touch, force, generate):
 
     if key:
         if generate:
-            ctx.fail("Invalid options: --generate conflicts with KEY argument.")
+            raise CliFail("Invalid options: --generate conflicts with KEY argument.")
         elif totp:
             key = parse_b32_key(key)
         else:
             key = parse_oath_key(key)
     else:
         if force and not generate:
-            ctx.fail(
+            raise CliFail(
                 "No secret key given. Remove the --force flag, "
                 "set the KEY argument or set the --generate flag."
             )
@@ -642,11 +660,12 @@ def chalresp(ctx, slot, key, totp, touch, force, generate):
             key = parse_oath_key(key)
 
     cred_type = "TOTP" if totp else "challenge-response"
-    force or click.confirm(
-        f"Program a {cred_type} credential in slot {slot}?",
-        abort=True,
-        err=True,
-    )
+    if not force:
+        click.confirm(
+            f"Program a {cred_type} credential in slot {slot}?",
+            abort=True,
+            err=True,
+        )
     try:
         session.put_configuration(
             slot,
@@ -654,6 +673,7 @@ def chalresp(ctx, slot, key, totp, touch, force, generate):
             ctx.obj["access_code"],
             ctx.obj["access_code"],
         )
+        click.echo(f"{cred_type} credential stored in slot {slot}.")
     except CommandError:
         raise CliFail(_WRITE_FAIL_MSG)
 
@@ -672,8 +692,8 @@ def chalresp(ctx, slot, key, totp, touch, force, generate):
     "--digits",
     type=click.Choice(["6", "8"]),
     default="6",
-    help="number of digits in generated TOTP code (default: 6), "
-    "ignored unless --totp is set",
+    show_default=True,
+    help="number of digits in generated TOTP code, ignored unless --totp is set",
 )
 @click.pass_context
 def calculate(ctx, slot, challenge, totp, digits):
@@ -705,7 +725,7 @@ def calculate(ctx, slot, challenge, totp, digits):
                 challenge = time_challenge(int(challenge))
             except Exception:
                 logger.exception("Error parsing challenge")
-                ctx.fail("Timestamp challenge for TOTP must be an integer.")
+                raise CliFail("Timestamp challenge for TOTP must be an integer.")
     else:  # Challenge is hex
         challenge = bytes.fromhex(challenge)
 
@@ -747,18 +767,15 @@ def parse_modhex_or_bcd(value):
     "--digits",
     type=click.Choice(["6", "8"]),
     default="6",
-    help="number of digits in generated code (default is 6)",
+    show_default=True,
+    help="number of digits in generated code",
 )
 @click.option("-c", "--counter", type=int, default=0, help="initial counter value")
 @click.option("-i", "--identifier", help="token identifier")
-@click.option(
-    "--no-enter",
-    is_flag=True,
-    help="don't send an Enter keystroke after outputting the code",
-)
+@click_enter_option
 @click_force_option
 @click.pass_context
-def hotp(ctx, slot, key, digits, counter, identifier, no_enter, force):
+def hotp(ctx, slot, key, digits, counter, identifier, enter, force):
     """
     Program an HMAC-SHA1 OATH-HOTP credential.
 
@@ -810,9 +827,10 @@ def hotp(ctx, slot, key, digits, counter, identifier, no_enter, force):
             except Exception as e:
                 click.echo(e)
 
-    force or click.confirm(
-        f"Program a HOTP credential in slot {slot}?", abort=True, err=True
-    )
+    if not force:
+        click.confirm(
+            f"Program a HOTP credential in slot {slot}?", abort=True, err=True
+        )
     try:
         session.put_configuration(
             slot,
@@ -820,10 +838,11 @@ def hotp(ctx, slot, key, digits, counter, identifier, no_enter, force):
             .imf(counter)
             .token_id(token_id, mh1, mh2)
             .digits8(int(digits) == 8)
-            .append_cr(not no_enter),
+            .append_cr(enter),
             ctx.obj["access_code"],
             ctx.obj["access_code"],
         )
+        click.echo(f"HOTP credential stored in slot {slot}.")
     except CommandError:
         raise CliFail(_WRITE_FAIL_MSG)
 
@@ -842,12 +861,7 @@ def hotp(ctx, slot, key, digits, counter, identifier, no_enter, force):
 @click.option(
     "--delete-access-code", is_flag=True, help="remove access code from the slot"
 )
-@click.option(
-    "--enter/--no-enter",
-    default=True,
-    show_default=True,
-    help="send an Enter keystroke after slot output",
-)
+@click_enter_option
 @click.option(
     "-p",
     "--pacing",
@@ -859,9 +873,13 @@ def hotp(ctx, slot, key, digits, counter, identifier, no_enter, force):
 @click.option(
     "--use-numeric-keypad",
     is_flag=True,
-    show_default=True,
     help="use scancodes for numeric keypad when sending digits "
     "(helps for some keyboard layouts)",
+)
+@click.option(
+    "--serial-usb-visible",
+    is_flag=True,
+    help="make the serial number visible in the USB descriptor",
 )
 def settings(
     ctx,
@@ -871,6 +889,7 @@ def settings(
     enter,
     pacing,
     use_numeric_keypad,
+    serial_usb_visible,
     force,
 ):
     """
@@ -882,7 +901,7 @@ def settings(
     session = _get_session(ctx)
 
     if new_access_code and delete_access_code:
-        ctx.fail("--new-access-code conflicts with --delete-access-code.")
+        raise CliFail("--new-access-code conflicts with --delete-access-code.")
 
     if delete_access_code and not ctx.obj["access_code"]:
         raise CliFail(
@@ -905,17 +924,17 @@ def settings(
         try:
             new_access_code = parse_access_code_hex(new_access_code)
         except Exception as e:
-            ctx.fail("Failed to parse access code: " + str(e))
+            raise CliFail("Failed to parse access code: " + str(e))
         if ctx.obj["info"].pin_complexity and len(set(new_access_code)) < 2:
             raise CliFail("Access code does not meet complexity requirement.")
 
-    force or click.confirm(
-        f"Update the settings for slot {slot}? "
-        "All existing settings will be overwritten.",
-        abort=True,
-        err=True,
-    )
-    click.echo(f"Updating settings for slot {slot}...")
+    if not force:
+        click.confirm(
+            f"Update the settings for slot {slot}? "
+            "All existing settings will be overwritten.",
+            abort=True,
+            err=True,
+        )
 
     pacing_bits = int(pacing or "0") // 20
     pacing_10ms = bool(pacing_bits & 1)
@@ -927,9 +946,11 @@ def settings(
             UpdateConfiguration()
             .append_cr(enter)
             .use_numeric(use_numeric_keypad)
-            .pacing(pacing_10ms, pacing_20ms),
+            .pacing(pacing_10ms, pacing_20ms)
+            .serial_usb_visible(serial_usb_visible),
             new_access_code,
             ctx.obj["access_code"],
         )
+        click.echo(f"Settings for slot {slot} updated.")
     except CommandError:
         raise CliFail(_WRITE_FAIL_MSG)

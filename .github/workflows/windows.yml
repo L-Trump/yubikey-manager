@@ -2,6 +2,8 @@ name: Windows
 
 on: [push, pull_request]
 
+permissions: read-all
+
 jobs:
   build:
 
@@ -10,23 +12,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Poetry
-        run: pipx install poetry
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12.2'
-          cache: poetry
+          python-version-file: ".python-version"
 
-      - name: Install dependencies
-        run: poetry install
+      - name: Install the project
+        run: uv sync --locked
+
+      - name: Run pre-commit hooks
+        run: |
+          uv tool install pre-commit
+          pre-commit run --all-files --verbose
 
       - name: Run unit tests
-        run: poetry run pytest -v
+        run: uv run pytest -v
 
       - name: Build
-        run: poetry build
+        run: uv build
 
       - name: Install from tar.gz
         shell: bash
@@ -48,7 +56,7 @@ jobs:
       - name: PyInstaller
         shell: bash
         run: |
-          poetry run pyinstaller ykman.spec
+          uv run pyinstaller ykman.spec
           dist/ckman/ckman.exe --version
           [[ -z "$(dist/ckman/ckman.exe --version | grep -E "not found|missing")" ]]
 

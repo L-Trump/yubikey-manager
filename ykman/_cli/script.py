@@ -25,13 +25,13 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from .util import click_force_option, click_command
-from .. import scripting  # noqa - make sure this file gets included by PyInstaller.
-
-import sys
-import click
 import logging
+import sys
 
+import click
+
+from .. import scripting  # noqa - make sure this file gets included by PyInstaller.
+from .util import click_command, click_force_option
 
 logger = logging.getLogger(__name__)
 
@@ -87,13 +87,15 @@ def run_script(ctx, site_dir, script, arguments, force):
 
     """
 
-    force or click.confirm(
-        f"{_WARNING}\n"
-        "You can bypass this message by running the command with the --force flag.\n\n"
-        "Run script?",
-        abort=True,
-        err=True,
-    )
+    if not force:
+        click.confirm(
+            f"{_WARNING}\n"
+            "You can bypass this message by running the command with the --force flag."
+            "\n\n"
+            "Run script?",
+            abort=True,
+            err=True,
+        )
 
     for sd in site_dir:
         logger.debug("Add %s to path.", sd)
@@ -102,4 +104,4 @@ def run_script(ctx, site_dir, script, arguments, force):
     script_body = script.read()
 
     sys.argv = [script.name, *arguments]
-    exec(script_body, {})  # nosec
+    exec(script_body, {})  # noqa: S102

@@ -25,35 +25,39 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+from __future__ import annotations
+
+import abc
+import logging
+import struct
+import warnings
+from dataclasses import dataclass, field
+from enum import IntEnum, IntFlag, unique
+from typing import Mapping
+
+from fido2.hid import CAPABILITY as CTAP_CAPABILITY
+
 from .core import (
+    TRANSPORT,
+    USB_INTERFACE,
+    ApplicationNotAvailableError,
+    BadResponseError,
+    NotSupportedError,
+    Tlv,
+    Version,
     bytes2int,
     int2bytes,
     require_version,
-    Version,
-    Tlv,
-    TRANSPORT,
-    USB_INTERFACE,
-    NotSupportedError,
-    BadResponseError,
-    ApplicationNotAvailableError,
-)
-from .core.otp import (
-    check_crc,
-    OtpConnection,
-    OtpProtocol,
-    STATUS_OFFSET_PROG_SEQ,
-    CommandRejectedError,
 )
 from .core.fido import FidoConnection
-from .core.smartcard import AID, SmartCardConnection, SmartCardProtocol
-from fido2.hid import CAPABILITY as CTAP_CAPABILITY
-
-from enum import IntEnum, IntFlag, unique
-from dataclasses import dataclass, field
-from typing import Optional, Union, Mapping
-import abc
-import struct
-import logging
+from .core.otp import (
+    STATUS_OFFSET_PROG_SEQ,
+    CommandRejectedError,
+    OtpConnection,
+    OtpProtocol,
+    check_crc,
+)
+from .core.smartcard import AID, ScpKeyParams, SmartCardConnection, SmartCardProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +78,45 @@ class CAPABILITY(IntFlag):
         name = "|".join(c.name or str(c) for c in CAPABILITY if c in self)
         return f"{name}: {hex(self)}"
 
+    @classmethod
+    def _from_fips(cls, fips: int) -> CAPABILITY:
+        c = CAPABILITY(0)
+        if fips & (1 << 0):
+            c |= CAPABILITY.FIDO2
+        if fips & (1 << 1):
+            c |= CAPABILITY.PIV
+        if fips & (1 << 2):
+            c |= CAPABILITY.OPENPGP
+        if fips & (1 << 3):
+            c |= CAPABILITY.OATH
+        if fips & (1 << 4):
+            c |= CAPABILITY.HSMAUTH
+        return c
+
+    @classmethod
+    def _from_aid(cls, aid: AID) -> CAPABILITY:
+        # TODO: match on prefix?
+        try:
+            return getattr(CAPABILITY, aid.name)
+        except AttributeError:
+            pass
+        if aid == AID.FIDO:
+            return CAPABILITY.FIDO2
+        raise ValueError("Unhandled AID")
+
     @property
     def display_name(self) -> str:
+        if self == 0:
+            return "None"
+        if bin(self).count("1") > 1:
+            i = 1
+            names = []
+            while i < self:
+                if i & self:
+                    names.append(CAPABILITY(i).display_name)
+                i <<= 1
+            return ", ".join(names)
+
         if self == CAPABILITY.OTP:
             return "Yubico OTP"
         elif self == CAPABILITY.U2F:
@@ -84,10 +125,7 @@ class CAPABILITY(IntFlag):
             return "OpenPGP"
         elif self == CAPABILITY.HSMAUTH:
             return "YubiHSM Auth"
-        # mypy bug?
-        return self.name or ", ".join(
-            c.display_name for c in CAPABILITY if c in self  # type: ignore
-        )
+        return self.name or f"Unknown(0x{self:x})"
 
     @property
     def usb_interfaces(self) -> USB_INTERFACE:
@@ -140,7 +178,7 @@ class FORM_FACTOR(IntEnum):
             return "Unknown"
 
     @classmethod
-    def from_code(cls, code: int) -> "FORM_FACTOR":
+    def from_code(cls, code: int) -> FORM_FACTOR:
         if code and not isinstance(code, int):
             raise ValueError(f"Invalid form factor code: {code}")
         code &= 0xF
@@ -162,6 +200,18 @@ class DEVICE_FLAG(IntFlag):
     EJECT = 0x80
 
 
+@unique
+class RELEASE_TYPE(IntEnum):
+    """YubiKey release type."""
+
+    ALPHA = 0
+    BETA = 1
+    FINAL = 2
+
+    def __str__(self):
+        return self.name.lower()
+
+
 TAG_USB_SUPPORTED = 0x01
 TAG_SERIAL = 0x02
 TAG_USB_ENABLED = 0x03
@@ -181,26 +231,31 @@ TAG_MORE_DATA = 0x10
 TAG_FREE_FORM = 0x11
 TAG_HID_INIT_DELAY = 0x12
 TAG_PART_NUMBER = 0x13
+TAG_FIPS_CAPABLE = 0x14
+TAG_FIPS_APPROVED = 0x15
 TAG_PIN_COMPLEXITY = 0x16
 TAG_NFC_RESTRICTED = 0x17
 TAG_RESET_BLOCKED = 0x18
+TAG_VERSION_QUALIFIER = 0x19
+TAG_FPS_VERSION = 0x20
+TAG_STM_VERSION = 0x21
 
 
 @dataclass
 class DeviceConfig:
     """Management settings for YubiKey which can be configured by the user."""
 
-    enabled_capabilities: Mapping[TRANSPORT, CAPABILITY] = field(default_factory=dict)
-    auto_eject_timeout: Optional[int] = None
-    challenge_response_timeout: Optional[int] = None
-    device_flags: Optional[DEVICE_FLAG] = None
-    nfc_restricted: Optional[bool] = None
+    enabled_capabilities: dict[TRANSPORT, CAPABILITY] = field(default_factory=dict)
+    auto_eject_timeout: int | None = None
+    challenge_response_timeout: int | None = None
+    device_flags: DEVICE_FLAG | None = None
+    nfc_restricted: bool | None = None
 
     def get_bytes(
         self,
         reboot: bool,
-        cur_lock_code: Optional[bytes] = None,
-        new_lock_code: Optional[bytes] = None,
+        cur_lock_code: bytes | None = None,
+        new_lock_code: bytes | None = None,
     ) -> bytes:
         buf = b""
         if reboot:
@@ -221,11 +276,26 @@ class DeviceConfig:
             buf += Tlv(TAG_DEVICE_FLAGS, int2bytes(self.device_flags))
         if new_lock_code:
             buf += Tlv(TAG_CONFIG_LOCK, new_lock_code)
-        if self.nfc_restricted is not None:
-            buf += Tlv(TAG_NFC_RESTRICTED, b"\1" if self.nfc_restricted else b"\0")
+        if self.nfc_restricted:
+            buf += Tlv(TAG_NFC_RESTRICTED, b"\1")
         if len(buf) > 0xFF:
             raise NotSupportedError("DeviceConfiguration too large")
         return int2bytes(len(buf)) + buf
+
+
+@dataclass(frozen=True)
+class VersionQualifier:
+    """Fully qualified YubiKey version"""
+
+    version: Version
+    type: RELEASE_TYPE = RELEASE_TYPE.FINAL
+    iteration: int = 0
+
+    def __str__(self):
+        return f"{self.version}.{self.type}.{self.iteration}"
+
+
+_DUMMY_VQ = VersionQualifier(Version(0, 0, 0))
 
 
 @dataclass
@@ -233,21 +303,42 @@ class DeviceInfo:
     """Information about a YubiKey readable using the ManagementSession."""
 
     config: DeviceConfig
-    serial: Optional[int]
+    serial: int | None
     version: Version
     form_factor: FORM_FACTOR
     supported_capabilities: Mapping[TRANSPORT, CAPABILITY]
     is_locked: bool
     is_fips: bool = False
     is_sky: bool = False
+    part_number: str | None = None
+    fips_capable: CAPABILITY = CAPABILITY(0)
+    fips_approved: CAPABILITY = CAPABILITY(0)
     pin_complexity: bool = False
     reset_blocked: CAPABILITY = CAPABILITY(0)
+    fps_version: Version | None = None
+    stm_version: Version | None = None
+    version_qualifier: VersionQualifier = _DUMMY_VQ
+
+    @property
+    def _is_bio(self) -> bool:
+        return self.form_factor in (FORM_FACTOR.USB_A_BIO, FORM_FACTOR.USB_C_BIO)
 
     def has_transport(self, transport: TRANSPORT) -> bool:
         return transport in self.supported_capabilities
 
+    @property
+    def version_name(self) -> str:
+        """The version of the YubiKey as a string."""
+        return (
+            str(self.version_qualifier)
+            if self.version_qualifier.type != RELEASE_TYPE.FINAL
+            else str(self.version)
+            if self.version
+            else "unknown"
+        )
+
     @classmethod
-    def parse(cls, encoded: bytes, default_version: Version) -> "DeviceInfo":
+    def parse(cls, encoded: bytes, default_version: Version) -> DeviceInfo:
         if len(encoded) - 1 != encoded[0]:
             raise BadResponseError("Invalid length")
         return cls.parse_tlvs(Tlv.parse_dict(encoded[1:]), default_version)
@@ -255,7 +346,7 @@ class DeviceInfo:
     @classmethod
     def parse_tlvs(
         cls, data: Mapping[int, bytes], default_version: Version
-    ) -> "DeviceInfo":
+    ) -> DeviceInfo:
         locked = data.get(TAG_CONFIG_LOCK) == b"\1"
         serial = bytes2int(data.get(TAG_SERIAL, b"\0")) or None
         ff_value = bytes2int(data.get(TAG_FORM_FACTOR, b"\0"))
@@ -284,8 +375,35 @@ class DeviceInfo:
             supported[TRANSPORT.NFC] = CAPABILITY(bytes2int(data[TAG_NFC_SUPPORTED]))
             enabled[TRANSPORT.NFC] = CAPABILITY(bytes2int(data[TAG_NFC_ENABLED]))
         nfc_restricted = data.get(TAG_NFC_RESTRICTED, b"\0") == b"\1"
+        try:
+            part_number = data.get(TAG_PART_NUMBER, b"").decode() or None
+        except UnicodeDecodeError:
+            part_number = None
+        fips_capable = CAPABILITY._from_fips(
+            bytes2int(data.get(TAG_FIPS_CAPABLE, b"\0"))
+        )
+        fips_approved = CAPABILITY._from_fips(
+            bytes2int(data.get(TAG_FIPS_APPROVED, b"\0"))
+        )
         pin_complexity = data.get(TAG_PIN_COMPLEXITY, b"\0") == b"\1"
         reset_blocked = CAPABILITY(bytes2int(data.get(TAG_RESET_BLOCKED, b"\0")))
+        vq = data.get(TAG_VERSION_QUALIFIER)
+        if vq:
+            vq_data = Tlv.parse_dict(vq)
+            version_qualifier = VersionQualifier(
+                Version.from_bytes(vq_data[0x01]),
+                RELEASE_TYPE(bytes2int(vq_data[0x02])),
+                bytes2int(vq_data[0x03]),
+            )
+            if version_qualifier.type != RELEASE_TYPE.FINAL:
+                logger.info(
+                    f"Overriding behavioral version with {version_qualifier.version}"
+                )
+                version = version_qualifier.version
+        else:
+            version_qualifier = VersionQualifier(version, RELEASE_TYPE.FINAL, 0)
+        fps_version = Version.from_bytes(data.get(TAG_FPS_VERSION, b"\0\0\0"))
+        stm_version = Version.from_bytes(data.get(TAG_STM_VERSION, b"\0\0\0"))
 
         return cls(
             DeviceConfig(enabled, auto_eject_to, chal_resp_to, flags, nfc_restricted),
@@ -296,8 +414,14 @@ class DeviceInfo:
             locked,
             fips,
             sky,
+            part_number,
+            fips_capable,
+            fips_approved,
             pin_complexity,
             reset_blocked,
+            fps_version or None,
+            stm_version or None,
+            version_qualifier,
         )
 
 
@@ -330,7 +454,7 @@ class Mode:
         return "+".join(t.name or str(t) for t in USB_INTERFACE if t in self.interfaces)
 
     @classmethod
-    def from_code(cls, code: int) -> "Mode":
+    def from_code(cls, code: int) -> Mode:
         # Mode is determined from the lowest 3 bits
         try:
             return cls(_MODES[code & 0b00000111])
@@ -348,20 +472,16 @@ class _Backend(abc.ABC):
     is_cano = False
 
     @abc.abstractmethod
-    def close(self) -> None:
-        ...
+    def close(self) -> None: ...
 
     @abc.abstractmethod
-    def set_mode(self, data: bytes) -> None:
-        ...
+    def set_mode(self, data: bytes) -> None: ...
 
     @abc.abstractmethod
-    def read_config(self, page: int = 0) -> bytes:
-        ...
+    def read_config(self, page: int = 0) -> bytes: ...
 
     @abc.abstractmethod
-    def write_config(self, config: bytes) -> None:
-        ...
+    def write_config(self, config: bytes) -> None: ...
 
 
 class _ManagementOtpBackend(_Backend):
@@ -408,13 +528,14 @@ P1_DEVICE_CONFIG = 0x11
 
 
 class _ManagementSmartCardBackend(_Backend):
-    def __init__(self, smartcard_connection):
+    def __init__(self, smartcard_connection, scp_key_params):
         self.protocol = SmartCardProtocol(smartcard_connection)
         try:
             select_bytes = self.protocol.select(AID.MANAGEMENT)
             if select_bytes[-2:] == b"\x90\x00":
                 # YubiKey Edge incorrectly appends SW twice.
                 select_bytes = select_bytes[:-2]
+
             select_str = select_bytes.decode()
             self.version = Version.from_string(select_str)
             if self.try_canokey_admin():
@@ -422,17 +543,23 @@ class _ManagementSmartCardBackend(_Backend):
             # For YubiKey NEO, we use the OTP application for further commands
             if self.version[0] == 3:
                 # Workaround to "de-select" on NEO, otherwise it gets stuck.
-                self.protocol.connection.send_and_receive(b"\xa4\x04\x00\x08")
+                smartcard_connection.send_and_receive(b"\xa4\x04\x00\x08")
+                if scp_key_params:
+                    raise ValueError("SCP is not supported")
                 self.protocol.select(AID.OTP)
+
         except ApplicationNotAvailableError:
             if self.try_canokey_admin():
                 return
-            if smartcard_connection.transport == TRANSPORT.NFC:
+            if smartcard_connection.transport == TRANSPORT.NFC and not scp_key_params:
                 # Probably NEO over NFC
                 status = self.protocol.select(AID.OTP)
                 self.version = Version.from_bytes(status[:3])
             else:
                 raise
+        self.protocol.configure(self.version)
+        if scp_key_params:
+            self.protocol.init_scp(scp_key_params)
 
     def try_canokey_admin(self):
         try:
@@ -489,7 +616,8 @@ class _ManagementCtapBackend(_Backend):
     def __init__(self, fido_connection):
         self.ctap = fido_connection
         version = fido_connection.device_version
-        if version[0] < 4:  # Prior to YK4 this was not firmware version
+        # Prior to YK4 this was not firmware version
+        if version[0] < 4 and version != (0, 0, 1):
             if not (
                 version[0] == 0 and fido_connection.capabilities & CTAP_CAPABILITY.CBOR
             ):
@@ -511,26 +639,46 @@ class _ManagementCtapBackend(_Backend):
 
 class ManagementSession:
     def __init__(
-        self, connection: Union[OtpConnection, SmartCardConnection, FidoConnection]
+        self,
+        connection: OtpConnection | SmartCardConnection | FidoConnection,
+        scp_key_params: ScpKeyParams | None = None,
     ):
         if isinstance(connection, OtpConnection):
+            if scp_key_params:
+                raise ValueError("SCP can only be used with SmartCardConnection")
             self.backend: _Backend = _ManagementOtpBackend(connection)
         elif isinstance(connection, SmartCardConnection):
-            self.backend = _ManagementSmartCardBackend(connection)
+            self.backend = _ManagementSmartCardBackend(connection, scp_key_params)
         elif isinstance(connection, FidoConnection):
+            if scp_key_params:
+                raise ValueError("SCP can only be used with SmartCardConnection")
             self.backend = _ManagementCtapBackend(connection)
         else:
             raise TypeError("Unsupported connection type")
+
+        if self.backend.version == (0, 0, 1):
+            logger.debug("Overriding development version...")
+            self.backend.version = self._do_read_device_info().version_qualifier.version
+
         logger.debug(
             "Management session initialized for "
             f"connection={type(connection).__name__}, version={self.version}"
         )
 
     def close(self) -> None:
+        """Close the underlying connection.
+
+        :deprecated: call .close() on the underlying connection instead.
+        """
+        warnings.warn(
+            "Deprecated: call .close() on the underlying connection instead.",
+            DeprecationWarning,
+        )
         self.backend.close()
 
     @property
     def version(self) -> Version:
+        """The firmware version of the YubiKey"""
         return self.backend.version
 
     def build_device_info(self):
@@ -568,6 +716,9 @@ class ManagementSession:
         if self.backend.is_cano:
             return self.build_device_info()
         require_version(self.version, (4, 1, 0))
+        return self._do_read_device_info()
+
+    def _do_read_device_info(self) -> DeviceInfo:
         more_data = True
         tlvs = {}
         page = 0
@@ -585,10 +736,10 @@ class ManagementSession:
 
     def write_device_config(
         self,
-        config: Optional[DeviceConfig] = None,
+        config: DeviceConfig | None = None,
         reboot: bool = False,
-        cur_lock_code: Optional[bytes] = None,
-        new_lock_code: Optional[bytes] = None,
+        cur_lock_code: bytes | None = None,
+        new_lock_code: bytes | None = None,
     ) -> None:
         """Write configuration settings for YubiKey.
 
@@ -617,7 +768,7 @@ class ManagementSession:
         self,
         mode: Mode,
         chalresp_timeout: int = 0,
-        auto_eject_timeout: Optional[int] = None,
+        auto_eject_timeout: int | None = None,
     ) -> None:
         """Write connection modes (USB interfaces) for YubiKey.
 
@@ -675,6 +826,12 @@ class ManagementSession:
             logger.info("Mode configuration written")
 
     def device_reset(self) -> None:
+        """Global factory reset.
+
+        This is only available for YubiKey Bio, which has a PIN that is shared between
+        applications. This will factory reset the global PIN as well as the associated
+        applications.
+        """
         if not isinstance(self.backend, _ManagementSmartCardBackend):
             raise NotSupportedError("Device reset can only be performed over CCID")
         logger.debug("Performing device reset")

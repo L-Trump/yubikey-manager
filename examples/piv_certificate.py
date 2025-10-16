@@ -22,22 +22,21 @@ And instead use sign_csr_builder instead of sign_certificate_builder.
 Usage: piv_certificate.py
 """
 
-from yubikit.piv import (
-    PivSession,
-    SLOT,
-    KEY_TYPE,
-    MANAGEMENT_KEY_TYPE,
-    DEFAULT_MANAGEMENT_KEY,
-)
-from ykman.piv import sign_certificate_builder
-from ykman import scripting as s
+import datetime
 
+import click
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509.oid import NameOID
 
-import datetime
-import click
+from ykman import scripting as s
+from ykman.piv import sign_certificate_builder
+from yubikit.piv import (
+    DEFAULT_MANAGEMENT_KEY,
+    KEY_TYPE,
+    SLOT,
+    PivSession,
+)
 
 # Use slot 9A (authentication), and key type RSA 2048
 slot = SLOT.AUTHENTICATION
@@ -57,7 +56,8 @@ click.echo("")
 key = click.prompt(
     "Enter management key", default=DEFAULT_MANAGEMENT_KEY.hex(), hide_input=True
 )
-piv.authenticate(MANAGEMENT_KEY_TYPE.TDES, bytes.fromhex(key))
+
+piv.authenticate(bytes.fromhex(key))
 
 # Generate a private key on the YubiKey
 print(f"Generating {key_type.name} key in slot {slot:X}...")

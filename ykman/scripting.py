@@ -26,21 +26,21 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 
+from time import sleep
+from typing import Generator
+
+from smartcard.Exceptions import CardConnectionException, NoCardException
+
+from yubikit.core import TRANSPORT
+from yubikit.core.fido import FidoConnection
+from yubikit.core.otp import OtpConnection
+from yubikit.core.smartcard import SmartCardConnection
+from yubikit.management import DeviceInfo
+from yubikit.support import get_name, read_info
+
 from .base import YkmanDevice
 from .device import list_all_devices, scan_devices
 from .pcsc import list_devices as list_ccid
-
-from yubikit.core import TRANSPORT
-from yubikit.core.otp import OtpConnection
-from yubikit.core.smartcard import SmartCardConnection
-from yubikit.core.fido import FidoConnection
-from yubikit.management import DeviceInfo
-from yubikit.support import get_name, read_info
-from smartcard.Exceptions import NoCardException, CardConnectionException
-
-from time import sleep
-from typing import Generator, Optional, Set
-
 
 """
 Various helpers intended to simplify scripting.
@@ -88,6 +88,9 @@ class ScriptingDevice:
     @property
     def name(self) -> str:
         return self._name
+
+    def reinsert(self, reinsert_cb=None, event=None):
+        self._wrapped.reinsert(reinsert_cb=reinsert_cb, event=event)
 
     def otp(self) -> OtpConnection:
         """Establish a OTP connection."""
@@ -138,7 +141,7 @@ def multi(
         insert a YubiKey.
     """
     state = None
-    handled_serials: Set[Optional[int]] = set()
+    handled_serials: set[int | None] = set()
     pids, _ = scan_devices()
     n_devs = sum(pids.values())
     if n_devs == 0:
@@ -223,8 +226,8 @@ def multi_nfc(
             prompted = True
         sleep(1.0)
 
-    handled_serials: Set[Optional[int]] = set()
-    current: Optional[int] = -1
+    handled_serials: set[int | None] = set()
+    current: int | None = -1
     while True:  # Run this until we stop the script with Ctrl+C
         try:
             with device.open_connection(SmartCardConnection) as connection:

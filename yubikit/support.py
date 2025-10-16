@@ -25,37 +25,37 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import logging
+from dataclasses import replace
+
 from .core import (
+    PID,
     TRANSPORT,
     YUBIKEY,
-    PID,
-    Version,
+    ApplicationNotAvailableError,
     Connection,
     NotSupportedError,
-    ApplicationNotAvailableError,
+    Version,
 )
-from .core.otp import OtpConnection, CommandRejectedError
 from .core.fido import FidoConnection
+from .core.otp import OtpConnection
 from .core.smartcard import (
     AID,
     SmartCardConnection,
     SmartCardProtocol,
 )
 from .management import (
-    ManagementSession,
-    DeviceInfo,
-    DeviceConfig,
-    Mode,
-    USB_INTERFACE,
     CAPABILITY,
-    FORM_FACTOR,
     DEVICE_FLAG,
+    FORM_FACTOR,
+    USB_INTERFACE,
+    DeviceConfig,
+    DeviceInfo,
+    ManagementSession,
+    Mode,
+    VersionQualifier,
 )
 from .yubiotp import YubiOtpSession
-
-from time import sleep
-from typing import Optional
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -76,15 +76,17 @@ _BASE_NEO_APPS = CAPABILITY.OTP | CAPABILITY.OATH | CAPABILITY.PIV | CAPABILITY.
 
 
 def _read_info_ccid(conn, key_type, interfaces):
-    version: Optional[Version] = None
+    version: Version | None = None
     try:
         mgmt = ManagementSession(conn)
         version = mgmt.version
         try:
             return mgmt.read_device_info()
         except NotSupportedError:
-            # Workaround to "de-select" the Management Applet needed for NEO
-            conn.send_and_receive(b"\xa4\x04\x00\x08")
+            if version.major == 3:
+                # Workaround to "de-select" the Management Applet needed for NEO
+                logger.debug("Send NEO de-select workaround...")
+                conn.send_and_receive(b"\xa4\x04\x00\x08")
     except ApplicationNotAvailableError:
         logger.debug("Couldn't select Management application, use fallback")
 
@@ -148,40 +150,22 @@ def _read_info_ccid(conn, key_type, interfaces):
             TRANSPORT.NFC: capabilities,
         },
         is_locked=False,
+        version_qualifier=VersionQualifier(version),
     )
 
 
 def _read_info_otp(conn, key_type, interfaces):
-    otp = None
-    serial = None
-
     try:
         mgmt = ManagementSession(conn)
-    except ApplicationNotAvailableError:
-        otp = YubiOtpSession(conn)
-
-    # Retry during potential reclaim timeout period (~3s).
-    for _ in range(8):
-        try:
-            if otp is None:
-                try:
-                    return mgmt.read_device_info()  # Rejected while reclaim
-                except NotSupportedError:
-                    otp = YubiOtpSession(conn)
-            serial = otp.get_serial()  # Rejected if reclaim (or not API_SERIAL_VISIBLE)
-            break
-        except CommandRejectedError:
-            if otp and interfaces == USB_INTERFACE.OTP:
-                break  # Can't be reclaim with only one interface
-            logger.debug("Potential reclaim, sleep...", exc_info=True)
-            sleep(0.5)  # Potential reclaim
-    else:
-        otp = YubiOtpSession(conn)
+        return mgmt.read_device_info()
+    except (ApplicationNotAvailableError, NotSupportedError):
+        logger.debug("Unable to get info via Management application, use fallback")
 
     # Synthesize info
-    logger.debug("Unable to get info via Management application, use fallback")
-
+    otp = YubiOtpSession(conn)
+    serial = otp.get_serial()
     version = otp.version
+
     if key_type == YUBIKEY.NEO:
         usb_supported = _BASE_NEO_APPS
         if USB_INTERFACE.FIDO in interfaces or version >= (3, 3, 0):
@@ -211,6 +195,7 @@ def _read_info_otp(conn, key_type, interfaces):
         form_factor=FORM_FACTOR.UNKNOWN,
         supported_capabilities=capabilities.copy(),
         is_locked=False,
+        version_qualifier=VersionQualifier(version),
     )
 
 
@@ -244,10 +229,11 @@ def _read_info_ctap(conn, key_type, interfaces):
             form_factor=FORM_FACTOR.USB_A_KEYCHAIN,
             supported_capabilities=supported_apps,
             is_locked=False,
+            version_qualifier=VersionQualifier(version),
         )
 
 
-def read_info(conn: Connection, pid: Optional[PID] = None) -> DeviceInfo:
+def read_info(conn: Connection, pid: PID | None = None) -> DeviceInfo:
     """Reads out DeviceInfo from a YubiKey, or attempts to synthesize the data.
 
     Reading DeviceInfo from a ManagementSession is only supported for newer YubiKeys.
@@ -263,7 +249,7 @@ def read_info(conn: Connection, pid: Optional[PID] = None) -> DeviceInfo:
 
     logger.debug(f"Attempting to read device info, using {type(conn).__name__}")
     if pid:
-        key_type: Optional[YUBIKEY] = pid.yubikey_type
+        key_type: YUBIKEY | None = pid.yubikey_type
         interfaces = pid.usb_interfaces
     elif isinstance(conn, SmartCardConnection) and conn.transport == TRANSPORT.NFC:
         # No PID for NFC connections
@@ -326,17 +312,14 @@ def read_info(conn: Connection, pid: Optional[PID] = None) -> DeviceInfo:
     if (4, 4, 0) <= info.version < (4, 5, 0):
         info.is_fips = True
 
-    # Set nfc_enabled if missing (pre YubiKey 5)
-    if (
-        info.has_transport(TRANSPORT.NFC)
-        and TRANSPORT.NFC not in info.config.enabled_capabilities
-    ):
-        info.config.enabled_capabilities[TRANSPORT.NFC] = info.supported_capabilities[
-            TRANSPORT.NFC
-        ]
-
-    # Workaround for invalid configurations.
-    if info.version >= (4, 0, 0):
+    # Fix NFC if needed
+    if info.has_transport(TRANSPORT.NFC):
+        # Set nfc_enabled if missing (pre YubiKey 5)
+        if TRANSPORT.NFC not in info.config.enabled_capabilities:
+            info.config.enabled_capabilities[TRANSPORT.NFC] = (
+                info.supported_capabilities[TRANSPORT.NFC]
+            )
+        # Workaround for invalid configurations
         if info.form_factor in (
             FORM_FACTOR.USB_A_NANO,
             FORM_FACTOR.USB_C_NANO,
@@ -344,9 +327,11 @@ def read_info(conn: Connection, pid: Optional[PID] = None) -> DeviceInfo:
         ) or (
             info.form_factor is FORM_FACTOR.USB_C_KEYCHAIN and info.version < (5, 2, 4)
         ):
-            # Known not to have NFC
-            info.supported_capabilities.pop(TRANSPORT.NFC, None)
-            info.config.enabled_capabilities.pop(TRANSPORT.NFC, None)
+            # Known to not have NFC, remove capabilities
+            supported = dict(info.supported_capabilities)
+            del supported[TRANSPORT.NFC]
+            replace(info, supported_capabilities=supported)
+            del info.config.enabled_capabilities[TRANSPORT.NFC]
 
     logger.debug("Device info, after tweaks: %s", info)
     return info
@@ -368,7 +353,7 @@ def _is_preview(version):
     return False
 
 
-def get_name(info: DeviceInfo, key_type: Optional[YUBIKEY]) -> str:
+def get_name(info: DeviceInfo, key_type: YUBIKEY | None) -> str:
     """Determine the product name of a YubiKey
 
     :param info: The device info.
@@ -417,37 +402,50 @@ def get_name(info: DeviceInfo, key_type: Optional[YUBIKEY]) -> str:
                 FORM_FACTOR.USB_A_NANO,
                 FORM_FACTOR.USB_C_NANO,
             )
-            is_bio = info.form_factor in (FORM_FACTOR.USB_A_BIO, FORM_FACTOR.USB_C_BIO)
+            is_bio = info._is_bio
             is_c = info.form_factor in (  # Does NOT include Ci
                 FORM_FACTOR.USB_C_KEYCHAIN,
                 FORM_FACTOR.USB_C_NANO,
                 FORM_FACTOR.USB_C_BIO,
             )
 
+            # Base name
             if info.is_sky:
                 name_parts = ["Security Key"]
             else:
                 name_parts = ["YubiKey"]
                 if not is_bio:
                     name_parts.append("5")
+
+            # Form factor additions
             if is_c:
                 name_parts.append("C")
             elif info.form_factor == FORM_FACTOR.USB_C_LIGHTNING:
                 name_parts.append("Ci")
+
             if is_nano:
                 name_parts.append("Nano")
-            if info.has_transport(TRANSPORT.NFC):
+            elif info.has_transport(TRANSPORT.NFC):
                 name_parts.append("NFC")
             elif info.form_factor == FORM_FACTOR.USB_A_KEYCHAIN:
                 name_parts.append("A")  # Only for non-NFC A Keychain.
-            if is_bio:
+            elif is_bio:
                 name_parts.append("Bio")
-                if _fido_only(usb_supported):
-                    name_parts.append("- FIDO Edition")
+
+            # Extra suffixes
             if info.is_fips:
                 name_parts.append("FIPS")
-            if info.is_sky and info.serial:
+            elif is_bio:
+                if _fido_only(usb_supported):
+                    name_parts.append("- FIDO Edition")
+                elif CAPABILITY.PIV in usb_supported:
+                    name_parts.append("- Multi-protocol Edition")
+            elif info.is_sky and info.serial:
                 name_parts.append("- Enterprise Edition")
+            elif info.pin_complexity and not info.is_sky:
+                name_parts.append("- Enhanced PIN")
+
+            # Combine parts into a name and make final adjustments
             device_name = " ".join(name_parts).replace("5 C", "5C").replace("5 A", "5A")
 
     return device_name

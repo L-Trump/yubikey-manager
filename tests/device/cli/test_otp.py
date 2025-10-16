@@ -27,12 +27,19 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from yubikit.management import CAPABILITY
-from .. import condition
+import re
 from time import sleep
 
-import re
 import pytest
+
+from yubikit.management import CAPABILITY
+
+from .. import condition
+
+
+def no_pin_complexity(info):
+    """PIN complexity enabled"""
+    return not info.pin_complexity
 
 
 @pytest.fixture(autouse=True)
@@ -47,14 +54,15 @@ class TestSlotStatus:
         assert "Slot 1:" in info
         assert "Slot 2:" in info
 
+    @condition.check(no_pin_complexity)
     def test_ykman_swap_slots(self, ykman_cli):
         info = ykman_cli("otp", "info").output
         if "programmed" not in info:
             ykman_cli("otp", "static", "2", "incredible")
         output = ykman_cli("otp", "swap", "-f").output
-        assert "Swapping slots..." in output
+        assert "Slots swapped" in output
         output = ykman_cli("otp", "swap", "-f").output
-        assert "Swapping slots..." in output
+        assert "Slots swapped" in output
 
     @condition.yk4_fips(False)
     def test_ykman_otp_info_does_not_indicate_fips_mode_for_non_fips_key(
@@ -65,6 +73,7 @@ class TestSlotStatus:
 
 
 class TestReclaimTimeout:
+    @condition.check(no_pin_complexity)
     def test_update_after_reclaim(self, ykman_cli):
         info = ykman_cli("otp", "info").output
         if "programmed" not in info:
@@ -78,6 +87,7 @@ class TestReclaimTimeout:
 
 class TestSlotStaticPassword:
     @pytest.fixture(autouse=True)
+    @condition.check(no_pin_complexity)
     def delete_slot(self, ykman_cli):
         try:
             ykman_cli("otp", "delete", "2", "-f")
@@ -145,6 +155,7 @@ class TestSlotStaticPassword:
 
 class TestSlotProgramming:
     @pytest.fixture(autouse=True)
+    @condition.check(no_pin_complexity)
     def delete_slot(self, ykman_cli):
         try:
             ykman_cli("otp", "delete", "2", "-f")
@@ -176,10 +187,7 @@ class TestSlotProgramming:
             "otp",
             "yubiotp",
             "2",
-            input="vvccccfiluij\n"
-            "267e0a88949b\n"
-            "b8e31ab90bb8830e3c1fe1b483a8e0d4\n"
-            "y\n",
+            input="vvccccfiluij\n267e0a88949b\nb8e31ab90bb8830e3c1fe1b483a8e0d4\ny\n",
         )
         self._check_slot_2_programmed(ykman_cli)
 
@@ -284,9 +292,7 @@ class TestSlotProgramming:
             )
         self._check_slot_2_not_programmed(ykman_cli)
 
-    def test_ykman_program_otp_slot_2_generate_id_conflicts_private_id(
-        self, ykman_cli
-    ):  # noqa: E501
+    def test_ykman_program_otp_slot_2_generate_id_conflicts_private_id(self, ykman_cli):  # noqa: E501
         with pytest.raises(SystemExit):
             ykman_cli(
                 "otp",
@@ -331,8 +337,8 @@ class TestSlotProgramming:
 
     def test_ykman_program_chalresp_slot_2_generated(self, ykman_cli):
         output = ykman_cli("otp", "chalresp", "2", "-f", "-g").output
-        assert re.match(
-            r"Using a randomly generated key \(hex\): [0-9a-f]{40}$", output
+        assert re.search(
+            r"Using a randomly generated key \(hex\): [0-9a-f]{40}", output
         )
         self._check_slot_2_programmed(ykman_cli)
 
@@ -357,12 +363,12 @@ class TestSlotProgramming:
     def test_update_settings_enter_slot_2(self, ykman_cli):
         ykman_cli("otp", "static", "2", "-f", "-g", "-l", "20")
         output = ykman_cli("otp", "settings", "2", "-f", "--no-enter").output
-        assert "Updating settings for slot" in output
+        assert "updated" in output
 
     def test_delete_slot_2(self, ykman_cli):
         ykman_cli("otp", "static", "2", "-f", "-g", "-l", "20")
         output = ykman_cli("otp", "delete", "2", "-f").output
-        assert "Deleting the configuration" in output
+        assert "deleted" in output
         status = ykman_cli("otp", "info").output
         assert "Slot 2: empty" in status
 
@@ -567,6 +573,7 @@ class TestSlotProgramming:
 
 class TestSlotCalculate:
     @pytest.fixture(autouse=True)
+    @condition.check(no_pin_complexity)
     def delete_slot(self, ykman_cli):
         try:
             ykman_cli("otp", "delete", "2", "-f")

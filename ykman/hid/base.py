@@ -25,7 +25,11 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from yubikit.core import TRANSPORT, PID
+from time import sleep
+
+from yubikit.core import PID, TRANSPORT, USB_INTERFACE
+from yubikit.core.otp import CommandRejectedError, OtpProtocol
+
 from ..base import YkmanDevice
 
 YUBICO_VID = 0x1050
@@ -38,7 +42,7 @@ class OtpYubiKeyDevice(YkmanDevice):
     """YubiKey USB HID OTP device"""
 
     def __init__(self, path, pid, connection_cls):
-        super(OtpYubiKeyDevice, self).__init__(TRANSPORT.USB, path, PID(pid))
+        super().__init__(TRANSPORT.USB, path, PID(pid))
         self.path = path
         self._connection_cls = connection_cls
 
@@ -46,6 +50,24 @@ class OtpYubiKeyDevice(YkmanDevice):
         return issubclass(self._connection_cls, connection_type)
 
     def open_connection(self, connection_type):
+        assert isinstance(connection_type, type)  # noqa: S101
         if self.supports_connection(connection_type):
-            return self._connection_cls(self.path)
-        return super(OtpYubiKeyDevice, self).open_connection(connection_type)
+            conn = self._connection_cls(self.path)
+            # If OTP-only, then it can't be reclaim
+            if self.pid and self.pid.usb_interfaces != USB_INTERFACE.OTP:
+                # Ensure we're not in reclaim
+                proto = OtpProtocol(conn)
+                for _ in range(6):
+                    try:
+                        # Read serial
+                        proto.send_and_receive(0x10, b"")
+                        break
+                    except CommandRejectedError:
+                        # In reclaim (maybe)
+                        sleep(0.5)
+            return conn
+
+        return super().open_connection(connection_type)
+
+    def _do_reinsert(self, reinsert_cb, event) -> None:
+        raise NotImplementedError("Reinsert is not implemented on this platform")

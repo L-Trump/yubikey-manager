@@ -25,46 +25,52 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from fido2.ctap import CtapError
+import csv as _csv
+import io
+import logging
+from dataclasses import asdict, replace
+from typing import NoReturn, Sequence
+
+import click
+from fido2.ctap import STATUS, CtapError
 from fido2.ctap1 import ApduError
 from fido2.ctap2 import (
-    Ctap2,
-    ClientPin,
-    CredentialManagement,
-    FPBioEnrollment,
     CaptureError,
+    ClientPin,
     Config,
+    CredentialManagement,
+    Ctap2,
+    FPBioEnrollment,
 )
-from fido2.pcsc import CtapPcscDevice
+
+from yubikit.core import TRANSPORT
+from yubikit.core.fido import FidoConnection, SmartCardCtapDevice
+from yubikit.core.smartcard import SW, SmartCardConnection
 from yubikit.management import CAPABILITY
-from yubikit.core.fido import FidoConnection
-from yubikit.core.smartcard import SW
-from time import sleep
+
+from ..base import REINSERT_STATUS
+from ..fido import (
+    fips_change_pin,
+    fips_reset,
+    fips_verify_pin,
+    is_in_fips_mode,
+)
 from .util import (
-    click_postpone_execution,
-    click_prompt,
+    CliFail,
     click_force_option,
     click_group,
-    prompt_timeout,
+    click_postpone_execution,
+    click_prompt,
     is_yk4_fips,
     pretty_print,
+    prompt_for_touch,
+    prompt_timeout,
 )
-from .util import CliFail
-from ..fido import is_in_fips_mode, fips_reset, fips_change_pin, fips_verify_pin
-from ..hid import list_ctap_devices
-from ..pcsc import list_devices as list_ccid
-from smartcard.Exceptions import NoCardException, CardConnectionException
-from typing import Optional, Sequence, List, Dict
-
-import io
-import csv as _csv
-import click
-import logging
 
 logger = logging.getLogger(__name__)
 
 
-@click_group(connections=[FidoConnection])
+@click_group(connections=[FidoConnection, SmartCardConnection])
 @click.pass_context
 @click_postpone_execution
 def fido(ctx):
@@ -83,13 +89,49 @@ def fido(ctx):
 
     """
     dev = ctx.obj["device"]
-    conn = dev.open_connection(FidoConnection)
-    ctx.call_on_close(conn.close)
+    info = ctx.obj["info"]
+
+    resolve_scp = ctx.obj.get("scp")
+    if resolve_scp:
+        s_conn = dev.open_connection(SmartCardConnection)
+        scp_params = resolve_scp(s_conn)
+        ctx.obj["scp_params"] = scp_params
+        conn = SmartCardCtapDevice(s_conn, scp_params)
+    elif dev.supports_connection(FidoConnection):
+        conn = dev.open_connection(FidoConnection)
+    elif (
+        dev.supports_connection(SmartCardConnection)
+        and dev.transport == TRANSPORT.USB
+        and info.config.enabled_capabilities[dev.transport] & 0x1000  # CCID_FIDO
+    ):
+        conn = dev.open_connection(SmartCardCtapDevice)
+    else:
+        raise CliFail("Unsupported connection type")
+
     ctx.obj["conn"] = conn
-    try:
+    # ctx.obj["conn"] might change its target later
+    ctx.call_on_close(lambda: ctx.obj["conn"].close())
+
+    if CAPABILITY.FIDO2 in info.config.enabled_capabilities[dev.transport]:
         ctx.obj["ctap2"] = Ctap2(conn)
-    except (ValueError, CtapError):
-        logger.info("FIDO device does not support CTAP2", exc_info=True)
+    else:
+        supported = CAPABILITY.FIDO2 in info.supported_capabilities[dev.transport]
+        logger.debug(f"CTAP2 not enabled, supported: {supported}")
+
+        if ctx.invoked_subcommand == "info":
+            return  # Don't fail on info command
+        if ctx.invoked_subcommand == "reset" and is_yk4_fips(info):
+            # Reset is supported on YK4 FIPS only
+            return
+
+        # Fail other commands if CTAP2 is not enabled
+        if supported:
+            raise CliFail(
+                "FIDO2 has been disabled on this YubiKey. "
+                "Use 'ykman config' to enable it."
+            )
+        else:
+            raise CliFail("This YubiKey does not support FIDO2.")
 
 
 @fido.command()
@@ -98,14 +140,20 @@ def info(ctx):
     """
     Display general status of the FIDO2 application.
     """
-    conn = ctx.obj["conn"]
+    info = ctx.obj["info"]
     ctap2 = ctx.obj.get("ctap2")
-    info: Dict = {}
-    lines: List = [info]
 
-    if is_yk4_fips(ctx.obj["info"]):
-        info["FIPS Approved Mode"] = "Yes" if is_in_fips_mode(conn) else "No"
-    elif ctap2:
+    data: dict = {}
+    lines: list = [data]
+
+    if CAPABILITY.FIDO2 in info.fips_capable:
+        data["FIPS approved"] = CAPABILITY.FIDO2 in info.fips_approved
+    elif is_yk4_fips(info):
+        data["FIPS approved"] = is_in_fips_mode(ctx.obj["conn"])
+
+    if ctap2:
+        if ctap2.info.aaguid:
+            data["AAGUID"] = str(ctap2.info.aaguid)
         client_pin = ClientPin(ctap2)  # N.B. All YubiKeys with CTAP2 support PIN.
         if ctap2.info.options["clientPin"]:
             if ctap2.info.force_pin_change:
@@ -115,44 +163,50 @@ def info(ctx):
                 )
             pin_retries, power_cycle = client_pin.get_pin_retries()
             if pin_retries:
-                info["PIN"] = f"{pin_retries} attempt(s) remaining"
+                data["PIN"] = f"{pin_retries} attempt(s) remaining"
                 if power_cycle:
                     lines.append(
                         "PIN is temporarily blocked. "
                         "Remove and re-insert the YubiKey to unblock."
                     )
             else:
-                info["PIN"] = "blocked"
+                data["PIN"] = "Blocked"
         else:
-            info["PIN"] = "not set"
-        info["Minimum PIN length"] = ctap2.info.min_pin_length
+            data["PIN"] = "Not set"
+        data["Minimum PIN length"] = ctap2.info.min_pin_length
 
         bio_enroll = ctap2.info.options.get("bioEnroll")
         if bio_enroll:
             uv_retries = client_pin.get_uv_retries()
             if uv_retries:
-                info["Fingerprints"] = f"registered, {uv_retries} attempt(s) remaining"
+                data["Fingerprints"] = f"Registered, {uv_retries} attempt(s) remaining"
             else:
-                info["Fingerprints"] = "registered, blocked until PIN is verified"
+                data["Fingerprints"] = "Registered, blocked until PIN is verified"
         elif bio_enroll is False:
-            info["Fingerprints"] = "not registered"
+            data["Fingerprints"] = "Not registered"
 
         always_uv = ctap2.info.options.get("alwaysUv")
         if always_uv is not None:
-            info["Always Require UV"] = "on" if always_uv else "off"
+            data["Always Require UV"] = "On" if always_uv else "Off"
 
         remaining_creds = ctap2.info.remaining_disc_creds
         if remaining_creds is not None:
-            info["Credential storage remaining"] = remaining_creds
+            data["Credential storage remaining"] = remaining_creds
 
         ep = ctap2.info.options.get("ep")
         if ep is not None:
-            info["Enterprise Attestation"] = "enabled" if ep else "disabled"
-
+            data["Enterprise Attestation"] = "Enabled" if ep else "Disabled"
     else:
-        info["PIN"] = "not supported"
+        dev = ctx.obj["device"]
+        supported = CAPABILITY.FIDO2 in info.supported_capabilities[dev.transport]
+        data["CTAP2"] = "Disabled" if supported else "Not supported"
+        data["PIN"] = "Disabled" if supported else "Not supported"
 
     click.echo("\n".join(pretty_print(lines)))
+
+
+def _ctap2_fingerprint(info):
+    return asdict(replace(info, enc_identifier=None))
 
 
 @fido.command("reset")
@@ -176,56 +230,25 @@ def reset(ctx, force):
             "use 'ykman config reset' for full factory reset."
         )
 
-    conn = ctx.obj["conn"]
-    if isinstance(conn, CtapPcscDevice):  # NFC
-        readers = list_ccid(conn._name)
-        if not readers or readers[0].reader.name != conn._name:
-            raise CliFail("Unable to isolate NFC reader.")
-        dev = readers[0]
-        logger.debug(f"use: {dev}")
-        is_fips = False
-
-        def prompt_re_insert():
-            click.echo(
-                "Remove and re-place your YubiKey on the NFC reader to perform the "
-                "reset..."
+    dev = ctx.obj["device"]
+    if CAPABILITY.FIDO2 in info.config.enabled_capabilities[dev.transport]:
+        transports = ctx.obj["ctap2"].info.transports_for_reset
+        if transports and dev.transport not in transports:
+            raise CliFail(
+                "Cannot perform FIDO reset on this YubiKey over the current transport. "
+                f"Allowed transports: {', '.join(transports)}"
             )
 
-            removed = False
-            while True:
-                sleep(0.5)
-                try:
-                    with dev.open_connection(FidoConnection):
-                        if removed:
-                            sleep(1.0)  # Wait for the device to settle
-                            break
-                except CardConnectionException:
-                    pass  # Expected, ignore
-                except NoCardException:
-                    removed = True
-            return dev.open_connection(FidoConnection)
+    conn = ctx.obj["conn"]
+    if dev.transport == TRANSPORT.NFC:
+        is_fips = False
+        remove_msg = "Remove your YubiKey from the NFC reader."
+        insert_msg = "Place your YubiKey back on the NFC reader now..."
 
     else:  # USB
-        n_keys = len(list_ctap_devices())
-        if n_keys > 1:
-            raise CliFail("Only one YubiKey can be connected to perform a reset.")
-        is_fips = is_yk4_fips(ctx.obj["info"])
-
-        ctap2 = ctx.obj.get("ctap2")
-        if not is_fips and not ctap2:
-            raise CliFail("This YubiKey does not support FIDO reset.")
-
-        def prompt_re_insert():
-            click.echo("Remove and re-insert your YubiKey to perform the reset...")
-
-            removed = False
-            while True:
-                sleep(0.5)
-                keys = list_ctap_devices()
-                if not keys:
-                    removed = True
-                if removed and len(keys) == 1:
-                    return keys[0].open_connection(FidoConnection)
+        is_fips = is_yk4_fips(info)
+        remove_msg = "Remove your YubiKey from the USB port."
+        insert_msg = "Re-insert your YubiKey now..."
 
     if not force:
         click.confirm(
@@ -246,15 +269,53 @@ def reset(ctx, force):
             if destroy_input != "OVERWRITE":
                 raise CliFail("Reset aborted by user.")
 
-        conn = prompt_re_insert()
+        conn.close()
+
+        def prompt_reinsert(status):
+            match status:
+                case REINSERT_STATUS.REMOVE:
+                    click.echo(remove_msg)
+                case REINSERT_STATUS.REINSERT:
+                    click.echo(insert_msg)
+
+        dev.reinsert(reinsert_cb=prompt_reinsert)
+
+        # Make sure to re-establish SCP, if used
+        scp_params = ctx.obj.get("scp_params")
+        if scp_params:
+            conn = SmartCardCtapDevice(
+                dev.open_connection(SmartCardConnection), scp_params
+            )
+        else:
+            conn = dev.open_connection(type(conn))
+        ctx.obj["conn"] = conn
 
     try:
-        with prompt_timeout():
-            if is_fips:
+        if is_fips:
+            with prompt_timeout():
                 fips_reset(conn)
-            else:
-                Ctap2(conn).reset()
-        logger.info("FIDO application data reset")
+        else:
+            ctap2 = Ctap2(conn)
+            if info.serial is None:
+                # Compare CTAP2 info to ensure we are resetting the same device.
+                if _ctap2_fingerprint(ctx.obj["ctap2"].info) != _ctap2_fingerprint(
+                    ctap2.info
+                ):
+                    raise CliFail("Inserted YubiKey does not match the one removed.")
+            touch_msg = (
+                "Press and hold the YubiKey button for 10 seconds to confirm."
+                if ctap2.info.long_touch_for_reset
+                else "Touch the YubiKey to confirm."
+            )
+
+            def on_keepalive(status):
+                if status == STATUS.UPNEEDED:
+                    prompt_for_touch(touch_msg)
+                elif status == STATUS.PROCESSING:
+                    click.echo("Reset in progress, DO NOT REMOVE YOUR YUBIKEY!")
+
+            ctap2.reset(on_keepalive=on_keepalive)
+        click.echo("FIDO application data reset.")
     except CtapError as e:
         if e.code == CtapError.ERR.ACTION_TIMEOUT:
             raise CliFail(
@@ -266,7 +327,7 @@ def reset(ctx, force):
                 "YubiKey is inserted."
             )
         else:
-            raise CliFail(f"Reset failed: {e.code.name}")
+            raise CliFail(f"Reset failed: {e.code.name}.")
     except ApduError as e:  # From fips_reset
         if e.code == SW.COMMAND_NOT_ALLOWED:
             raise CliFail(
@@ -279,13 +340,12 @@ def reset(ctx, force):
         raise CliFail("Reset failed.")
 
 
-def _fail_pin_error(ctx, e, other="%s"):
+def _fail_pin_error(ctx, e, other="%s") -> NoReturn:
     if e.code == CtapError.ERR.PIN_INVALID:
         raise CliFail("Wrong PIN.")
     elif e.code == CtapError.ERR.PIN_AUTH_BLOCKED:
         raise CliFail(
-            "PIN authentication is currently blocked. "
-            "Remove and re-insert the YubiKey."
+            "PIN authentication is currently blocked. Remove and re-insert the YubiKey."
         )
     elif e.code == CtapError.ERR.PIN_BLOCKED:
         raise CliFail("PIN is blocked.")
@@ -322,7 +382,8 @@ def change_pin(ctx, pin, new_pin, u2f):
     6 characters long.
     """
 
-    is_fips = is_yk4_fips(ctx.obj["info"])
+    info = ctx.obj["info"]
+    is_fips = is_yk4_fips(info)
 
     if is_fips and not u2f:
         raise CliFail(
@@ -339,85 +400,79 @@ def change_pin(ctx, pin, new_pin, u2f):
     if is_fips:
         conn = ctx.obj["conn"]
         min_len = 6
+        max_len = 32
+
+        def _fips_change_pin(new_pin):
+            fips_pin = pin or ""
+            try:
+                # Failing this with empty current PIN does not cost a retry
+                fips_change_pin(conn, fips_pin, new_pin)
+            except ApduError as e:
+                if e.code == SW.WRONG_LENGTH:
+                    fips_pin = _prompt_current_pin()
+                    _fail_if_not_valid_pin(fips_pin)
+                    fips_change_pin(conn, fips_pin, new_pin)
+                else:
+                    raise
+
+        do_change = _fips_change_pin
+
     else:
         ctap2 = ctx.obj.get("ctap2")
         if not ctap2:
             raise CliFail("PIN is not supported on this YubiKey.")
         client_pin = ClientPin(ctap2)
         min_len = ctap2.info.min_pin_length
-
-    def _fail_if_not_valid_pin(pin=None, name="PIN"):
-        if not pin or len(pin) < min_len:
-            raise CliFail(f"{name} must be at least {min_len} characters long")
-
-    def prompt_new_pin():
-        return click_prompt(
-            "Enter your new PIN",
-            hide_input=True,
-            confirmation_prompt=True,
-        )
-
-    def change_pin(pin, new_pin):
-        try:
-            if is_fips:
-                try:
-                    # Failing this with empty current PIN does not cost a retry
-                    fips_change_pin(conn, pin or "", new_pin)
-                except ApduError as e:
-                    if e.code == SW.WRONG_LENGTH:
-                        pin = _prompt_current_pin()
-                        _fail_if_not_valid_pin(pin)
-                        fips_change_pin(conn, pin, new_pin)
-                    else:
-                        raise
-
-            else:
-                client_pin.change_pin(pin, new_pin)
-
-        except CtapError as e:
-            if e.code == CtapError.ERR.PIN_POLICY_VIOLATION:
-                raise CliFail("New PIN doesn't meet complexity requirements.")
-            else:
-                _fail_pin_error(ctx, e, "Failed to change PIN: %s")
-
-        except ApduError as e:
-            if e.code == SW.VERIFY_FAIL_NO_RETRY:
-                raise CliFail("Wrong PIN.")
-            elif e.code == SW.AUTH_METHOD_BLOCKED:
-                raise CliFail("PIN is blocked.")
-            else:
-                raise CliFail(f"Failed to change PIN: SW={e.code:04x}")
-
-    def set_pin(new_pin):
-        _fail_if_not_valid_pin(new_pin)
-        try:
-            client_pin.set_pin(new_pin)
-        except CtapError as e:
-            if e.code == CtapError.ERR.PIN_POLICY_VIOLATION:
-                raise CliFail("New PIN doesn't meet complexity requirements.")
-            else:
-                raise CliFail(f"Failed to set PIN: {e.code}")
-
-    if not is_fips:
+        max_len = ctap2.info.max_pin_length
+        if (
+            info._is_bio
+            and CAPABILITY.PIV in info.config.enabled_capabilities[TRANSPORT.USB]
+        ):
+            max_len = 8
         if ctap2.info.options.get("clientPin"):
             if not pin:
                 pin = _prompt_current_pin()
+
+            def _ctap2_change_pin(new_pin):
+                client_pin.change_pin(pin, new_pin)
+
+            do_change = _ctap2_change_pin
         else:
             if pin:
                 raise CliFail("There is no current PIN set. Use --new-pin to set one.")
 
+            do_change = client_pin.set_pin
+
+    def _fail_if_not_valid_pin(pin=None, name="PIN"):
+        if not pin or len(pin) < min_len:
+            raise CliFail(f"{name} must be at least {min_len} characters long.")
+        if len(pin) > max_len:
+            raise CliFail(f"{name} must be at most {max_len} characters long.")
+
     if not new_pin:
-        new_pin = prompt_new_pin()
+        new_pin = click_prompt(
+            "Enter your new PIN",
+            hide_input=True,
+            confirmation_prompt=True,
+        )
     _fail_if_not_valid_pin(new_pin, "New PIN")
 
-    if is_fips:
-        change_pin(pin, new_pin)
-    else:
-        if ctap2.info.options.get("clientPin"):
-            change_pin(pin, new_pin)
+    try:
+        do_change(new_pin)
+    except CtapError as e:
+        if e.code == CtapError.ERR.PIN_POLICY_VIOLATION:
+            raise CliFail("New PIN doesn't meet complexity requirements.")
         else:
-            set_pin(new_pin)
-    logger.info("FIDO PIN updated")
+            _fail_pin_error(ctx, e, "Failed to change PIN: %s.")
+    except ApduError as e:
+        if e.code == SW.VERIFY_FAIL_NO_RETRY:
+            raise CliFail("Wrong PIN.")
+        elif e.code == SW.AUTH_METHOD_BLOCKED:
+            raise CliFail("PIN is blocked.")
+        else:
+            raise CliFail(f"Failed to change PIN: SW={e.code:04x}.")
+
+    click.echo("FIDO PIN updated.")
 
 
 def _require_pin(ctx, pin, feature="This feature"):
@@ -454,7 +509,7 @@ def verify(ctx, pin):
                 pin, ClientPin.PERMISSION.GET_ASSERTION, "ykman.example.com"
             )
         except CtapError as e:
-            raise CliFail(f"PIN verification failed: {e}")
+            raise CliFail(f"PIN verification failed: {e}.")
     elif is_yk4_fips(ctx.obj["info"]):
         try:
             fips_verify_pin(ctx.obj["conn"], pin)
@@ -466,7 +521,7 @@ def verify(ctx, pin):
             elif e.code == SW.COMMAND_NOT_ALLOWED:
                 raise CliFail("PIN is not set.")
             else:
-                raise CliFail(f"PIN verification failed: {e.code.name}")
+                raise CliFail(f"PIN verification failed: {e.code:04x}.")
     else:
         raise CliFail("This YubiKey does not support a FIDO PIN.")
     click.echo("PIN verified.")
@@ -488,7 +543,7 @@ def _init_config(ctx, pin):
                 pin, ClientPin.PERMISSION.AUTHENTICATOR_CFG
             )
         except CtapError as e:
-            _fail_pin_error(ctx, e, "PIN error: %s")
+            _fail_pin_error(ctx, e, "PIN error: %s.")
 
     return Config(ctap2, protocol, token)
 
@@ -500,30 +555,31 @@ def force_pin_change(ctx, pin):
     """
     Force the PIN to be changed to a new value before use.
     """
-    options = ctx.obj.get("ctap2").info.options
-    if not options.get("setMinPINLength"):
+    options = ctx.obj["ctap2"].info.options if "ctap2" in ctx.obj else None
+    if options is None or not options.get("setMinPINLength"):
         raise CliFail("Force change PIN is not supported on this YubiKey.")
     if not options.get("clientPin"):
         raise CliFail("No PIN is set.")
 
     config = _init_config(ctx, pin)
     config.set_min_pin_length(force_change_pin=True)
+    click.echo("Force PIN change set.")
 
 
 @access.command("set-min-length")
 @click.pass_context
 @click.option("-P", "--pin", help="PIN code")
 @click.option("-R", "--rp-id", multiple=True, help="RP ID to allow")
-@click.argument("length", type=click.IntRange(4))
+@click.argument("length", type=click.IntRange(4, 63))
 def set_min_pin_length(ctx, pin, rp_id, length):
     """
     Set the minimum length allowed for PIN.
 
-    Optionally use the --rp option to specify which RPs are allowed to request this
+    Optionally use the --rp-id option to specify which RPs are allowed to request this
     information.
     """
-    info = ctx.obj["ctap2"].info
-    if not info.options.get("setMinPINLength"):
+    info = ctx.obj["ctap2"].info if "ctap2" in ctx.obj else None
+    if info is None or not info.options.get("setMinPINLength"):
         raise CliFail("Set minimum PIN length is not supported on this YubiKey.")
     if info.options.get("alwaysUv") and not info.options.get("clientPin"):
         raise CliFail(
@@ -533,6 +589,14 @@ def set_min_pin_length(ctx, pin, rp_id, length):
     min_len = info.min_pin_length
     if length < min_len:
         raise CliFail(f"Cannot set a minimum length that is shorter than {min_len}.")
+
+    dev_info = ctx.obj["info"]
+    if (
+        dev_info._is_bio
+        and CAPABILITY.PIV in dev_info.config.enabled_capabilities[TRANSPORT.USB]
+        and length > 8
+    ):
+        raise CliFail("Cannot set a minimum length that is longer than 8.")
 
     config = _init_config(ctx, pin)
     if rp_id:
@@ -544,6 +608,7 @@ def set_min_pin_length(ctx, pin, rp_id, length):
             )
 
     config.set_min_pin_length(min_pin_length=length, rp_ids=rp_id)
+    click.echo("Minimum PIN length set.")
 
 
 def _prompt_current_pin(prompt="Enter your current PIN"):
@@ -565,7 +630,7 @@ def _gen_creds(credman):
             )
 
 
-def _format_table(headings: Sequence[str], rows: List[Sequence[str]]) -> str:
+def _format_table(headings: Sequence[str], rows: list[Sequence[str]]) -> str:
     all_rows = [headings] + rows
     padded_rows = [["" for cell in row] for row in all_rows]
 
@@ -614,7 +679,7 @@ def _init_credman(ctx, pin):
     try:
         token = client_pin.get_pin_token(pin, ClientPin.PERMISSION.CREDENTIAL_MGMT)
     except CtapError as e:
-        _fail_pin_error(ctx, e, "PIN error: %s")
+        _fail_pin_error(ctx, e, "PIN error: %s.")
 
     return CredentialManagement(ctap2, client_pin.protocol, token)
 
@@ -695,8 +760,9 @@ def creds_delete(ctx, credential_id, pin, force):
             f"Delete {rp_id} {user_name} {display_name} ({cred_id['id'].hex()})?"
         ):
             try:
+                click.echo("Deleting credential, DO NOT REMOVE YOUR YUBIKEY!")
                 credman.delete_cred(cred_id)
-                logger.info("Credential deleted")
+                click.echo("Credential deleted.")
             except CtapError:
                 raise CliFail("Failed to delete credential.")
     else:
@@ -739,7 +805,7 @@ def _init_bio(ctx, pin):
     try:
         token = client_pin.get_pin_token(pin, ClientPin.PERMISSION.BIO_ENROLL)
     except CtapError as e:
-        _fail_pin_error(ctx, e, "PIN error: %s")
+        _fail_pin_error(ctx, e, "PIN error: %s.")
 
     return FPBioEnrollment(ctap2, client_pin.protocol, token)
 
@@ -798,7 +864,7 @@ def bio_enroll(ctx, name, pin):
                 )
             elif e.code == CtapError.ERR.USER_ACTION_TIMEOUT:
                 raise CliFail("Failed to add fingerprint due to user inactivity.")
-            raise CliFail(f"Failed to add fingerprint: {e.code.name}")
+            raise CliFail(f"Failed to add fingerprint: {e.code.name}.")
     logger.info("Fingerprint template registered")
     click.echo("Capture complete.")
     bio.set_name(template_id, name)
@@ -829,7 +895,7 @@ def bio_rename(ctx, template_id, name, pin):
         raise CliFail(f"No fingerprint matching ID={template_id}.")
 
     bio.set_name(key, name)
-    logger.info("Fingerprint template renamed")
+    click.echo("Fingerprint template renamed.")
 
 
 @bio.command("delete")
@@ -848,15 +914,15 @@ def bio_delete(ctx, template_id, pin, force):
     enrollments = bio.enumerate_enrollments()
 
     try:
-        key: Optional[bytes] = bytes.fromhex(template_id)
+        key: bytes | None = bytes.fromhex(template_id)
     except ValueError:
         key = None
 
-    if key not in enrollments:
+    if not key or key not in enrollments:
         # Match using template_id as NAME
         matches = [k for k in enrollments if enrollments[k] == template_id]
         if len(matches) == 0:
-            raise CliFail(f"No fingerprint matching ID={template_id}")
+            raise CliFail(f"No fingerprint matching ID={template_id}.")
         elif len(matches) > 1:
             raise CliFail(
                 f"Multiple matches for NAME={template_id}. "
@@ -868,9 +934,9 @@ def bio_delete(ctx, template_id, pin, force):
     if force or click.confirm(f"Delete fingerprint {_format_fp(key, name)}?"):
         try:
             bio.remove_enrollment(key)
-            logger.info("Fingerprint template deleted")
+            click.echo("Fingerprint template deleted.")
         except CtapError as e:
-            raise CliFail(f"Failed to delete fingerprint: {e.code.name}")
+            raise CliFail(f"Failed to delete fingerprint: {e.code.name}.")
 
 
 @fido.group("config")
@@ -887,12 +953,19 @@ def toggle_always_uv(ctx, pin):
     """
     Toggles the state of Always Require User Verification.
     """
-    options = ctx.obj.get("ctap2").info.options
-    if "alwaysUv" not in options:
+    options = ctx.obj.get("ctap2").info.options if "ctap2" in ctx.obj else None
+    if not options or "alwaysUv" not in options:
         raise CliFail("Always Require UV is not supported on this YubiKey.")
+
+    info = ctx.obj["info"]
+    if CAPABILITY.FIDO2 in info.fips_capable:
+        raise CliFail("Always Require UV can not be disabled on this YubiKey.")
+
+    always_uv = options["alwaysUv"]
 
     config = _init_config(ctx, pin)
     config.toggle_always_uv()
+    click.echo(f"Always Require UV is {'off' if always_uv else 'on'}.")
 
 
 @config.command("enable-ep-attestation")
@@ -902,8 +975,8 @@ def enable_ep_attestation(ctx, pin):
     """
     Enables Enterprise Attestation for Authenticators pre-configured to support it.
     """
-    options = ctx.obj.get("ctap2").info.options
-    if "ep" not in options:
+    options = ctx.obj.get("ctap2").info.options if "ctap2" in ctx.obj else None
+    if not options or "ep" not in options:
         raise CliFail("Enterprise Attestation is not supported on this YubiKey.")
     if options.get("alwaysUv") and not options.get("clientPin"):
         raise CliFail(
@@ -913,3 +986,4 @@ def enable_ep_attestation(ctx, pin):
 
     config = _init_config(ctx, pin)
     config.enable_enterprise_attestation()
+    click.echo("Enterprise Attestation enabled.")
